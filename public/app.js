@@ -159,6 +159,25 @@ function moodleFileUrl(url) {
   return url;
 }
 
+/* ---------- Chat history persistence (localStorage) ---------- */
+const aiStorageKey = () => `moodle-viewer:ai:${state.siteUrl || 'unknown'}`;
+
+function saveAIMessages() {
+  try {
+    localStorage.setItem(aiStorageKey(), JSON.stringify(state.aiMessages));
+  } catch { /* storage unavailable */ }
+}
+
+function loadAIMessages() {
+  try {
+    const raw = localStorage.getItem(aiStorageKey());
+    const arr = raw ? JSON.parse(raw) : [];
+    state.aiMessages = Array.isArray(arr) ? arr : [];
+  } catch {
+    state.aiMessages = [];
+  }
+}
+
 const MOD_ICONS = {
   assign: '&#128221;', book: '&#128214;', chat: '&#128172;', choice: '&#128203;',
   data: '&#128451;', feedback: '&#128236;', folder: '&#128193;', forum: '&#128172;',
@@ -543,6 +562,7 @@ function renderAI(content) {
           <button class="btn ghost small" id="ai-provider-add" title="Add a provider">＋ Add</button>
           <button class="btn ghost small" id="ai-provider-edit" title="Edit provider">✎</button>
           <button class="btn ghost small" id="ai-provider-del" title="Delete provider">🗑</button>
+          <button class="btn ghost small" id="ai-clear" title="Clear chat history">🧹 Clear chat</button>
         </div>
         <div class="ai-history" id="ai-history"></div>
         <div class="error-box hidden" id="ai-no-provider" style="margin:0 12px 12px;">No AI provider configured. Click <b>＋ Add</b> above to add any OpenAI-compatible endpoint (e.g. NVIDIA NIM, OpenCode), or set <code>NVIDIA_API_KEY</code> on the server.</div>
@@ -589,6 +609,7 @@ function renderAI(content) {
     history.scrollTop = history.scrollHeight;
   };
 
+  loadAIMessages();
   state.aiMessages.forEach(renderMsg);
 
   /* ---------- AI provider management ---------- */
@@ -692,6 +713,14 @@ function renderAI(content) {
     } catch (e) { alert(e.message); }
   });
 
+  $('#ai-clear').addEventListener('click', () => {
+    if (!state.aiMessages.length) return;
+    if (!confirm('Clear this chat history?')) return;
+    state.aiMessages = [];
+    saveAIMessages();
+    history.innerHTML = '';
+  });
+
   refreshProviders().catch((e) => {
     noProvBox.classList.remove('hidden');
     noProvBox.textContent = `Could not load AI providers: ${e.message}`;
@@ -704,6 +733,7 @@ function renderAI(content) {
     input.value = '';
     state.aiMessages.push({ role: 'user', content: text });
     renderMsg({ role: 'user', content: text });
+    saveAIMessages();
 
     state.aiBusy = true;
     $('#ai-send').disabled = true;
@@ -772,9 +802,11 @@ function renderAI(content) {
       if (bubble) bubble.remove();
       state.aiMessages.push({ role: 'assistant', content: outcome.reply || '', trace: outcome.trace });
       renderMsg({ role: 'assistant', content: outcome.reply || '', trace: outcome.trace });
+      saveAIMessages();
     } catch (e) {
       if (bubble) bubble.remove();
       renderMsg({ role: 'assistant', content: `⚠️ ${e.message}` });
+      saveAIMessages();
     } finally {
       state.aiBusy = false;
       $('#ai-send').disabled = !state.providers.length;

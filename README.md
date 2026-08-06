@@ -40,6 +40,10 @@ an allow-list of the ~250 functions the official app uses.
 - **Markdown AI replies** — assistant answers are rendered as markdown
   (headings, lists, tables, code…) with sanitized, clickable links that open
   in a new tab.
+- **Persistent chat history** — the AI conversation is saved to the browser's
+  `localStorage` (scoped per Moodle site, so each account keeps its own
+  thread) and survives page reloads. A **🧹 Clear chat** button in the AI tab
+  wipes the stored history for the current site.
 - **Downloadable Moodle files** — file links the assistant returns
   (`webservice/pluginfile.php` etc.) are rewritten through the app's token
   proxy, so attachments (submissions, PDFs) download with one click. This
