@@ -71,6 +71,46 @@ function flattenParams(obj, prefix = '', out = {}) {
   return out;
 }
 
+/** Top-level params the AI tool sends that Moodle expects as integers. AI
+ * models routinely emit these as strings (e.g. assignid: "123") or send the
+ * wrong shape; Moodle answers with the generic "Detectado valor de parámetro no
+ * válido", which the model can't act on — so we coerce numeric strings here and
+ * reject non-numeric values up front with a precise hint. */
+const INT_PARAMS = new Set([
+  'userid', 'courseid', 'assignid', 'assignmentid', 'cmid', 'id',
+  'conversationid', 'forumid', 'discussionid', 'postid', 'replytoid',
+  'quizid', 'attemptid', 'groupingid', 'groupid', 'categoryid',
+  'timesortfrom', 'timesortto', 'timefrom', 'timeto', 'aftereventid',
+  'limitfrom', 'limitnum', 'limit', 'eventid', 'instanceid', 'reviewerid',
+]);
+
+/** Coerce known integer params in place. Returns the list of params that had
+ * non-numeric values (so the caller can fail with a precise error instead of
+ * letting Moodle reject them generically). */
+function coerceIntParams(params) {
+  const bad = [];
+  for (const key of Object.keys(params)) {
+    if (!INT_PARAMS.has(key)) continue;
+    const v = params[key];
+    if (v == null || typeof v === 'number') continue;
+    if (typeof v === 'boolean') { params[key] = v ? 1 : 0; continue; }
+    const s = String(v).trim();
+    if (/^-?\d+$/.test(s)) { params[key] = Number(s); continue; }
+    bad.push({ key, value: s.slice(0, 40) });
+  }
+  return bad;
+}
+
+/** Build the tool result payload Moodle sends back to the AI model on failure,
+ * including the params it sent and a type hint so it can self-correct. */
+function toolErrorContent(message, toolParams) {
+  return JSON.stringify({
+    error: message,
+    request_params: toolParams,
+    hint: 'IDs (userid, courseid, assignid, conversationid, …) must be integers; userid defaults to the current user when omitted/0.',
+  });
+}
+
 /** Validate a site URL and normalize it to https://host form. */
 function normalizeSiteUrl(raw) {
   if (!raw) return null;
@@ -569,7 +609,22 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
         history.push({
           role: 'tool',
           tool_call_id: call.id,
-          content: JSON.stringify({ error: `Function ${fn} is not available` }),
+          content: toolErrorContent(`Function ${fn} is not available`, toolParams),
+        });
+        continue;
+      }
+      // Coerce integer params the model sent as strings; reject non-numeric
+      // values up front with a precise hint so the model can self-correct.
+      const bad = coerceIntParams(toolParams);
+      if (bad.length) {
+        const hint = `Invalid parameter value: ${bad.map((b) => `${b.key}=${JSON.stringify(b.value)}`).join(', ')} (these must be integers).`;
+        const t = { function: fn, params: toolParams, ok: false, error: hint };
+        trace.push(t);
+        sendEvent({ type: 'tool', trace: t });
+        history.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: toolErrorContent(hint, toolParams),
         });
         continue;
       }
@@ -591,7 +646,7 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
         history.push({
           role: 'tool',
           tool_call_id: call.id,
-          content: JSON.stringify({ error: e.message }),
+          content: toolErrorContent(e.message, toolParams),
         });
       }
     }
@@ -746,6 +801,14 @@ const USERID_DEFAULT_FUNCTIONS = new Set([
   'core_user_get_private_files_info',
   'core_user_get_user_preferences',
   'core_badges_get_user_badges',
+  'mod_assign_get_submission_status',
+  'mod_assign_get_submissions',
+  'mod_assign_get_user_mappings',
+  'mod_assign_get_grades',
+  'mod_quiz_get_user_attempts',
+  'core_completion_get_activities_completion_status',
+  'core_message_get_conversation_messages',
+  'core_message_get_messages',
 ]);
 
 const ALLOWED_FUNCTIONS = [
