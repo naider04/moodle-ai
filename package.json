@@ -12,8 +12,10 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "dompurify": "^3.4.13",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "express-session": "^1.18.0"
+    "express-session": "^1.18.0",
+    "marked": "^18.0.9"
   }
 }

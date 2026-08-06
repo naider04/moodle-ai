@@ -92,6 +92,28 @@ async function streamAI(messages, handlers) {
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+/* ---------- Markdown rendering for AI replies ---------- */
+if (window.marked) {
+  marked.use({
+    gfm: true,
+    breaks: true,
+    renderer: {
+      // Open links in a new tab, safely.
+      link({ href, title, tokens }) {
+        const text = this.parser.parseInline(tokens);
+        return `<a href="${href}" target="_blank" rel="noopener noreferrer"${title ? ` title="${title}"` : ''}>${text}</a>`;
+      },
+    },
+  });
+}
+
+/** Render markdown → sanitized HTML (plain text fallback if libs missing). */
+const renderMarkdown = (text) => {
+  if (!window.marked) return esc(text);
+  const html = marked.parse(String(text ?? ''));
+  return window.DOMPurify ? DOMPurify.sanitize(html) : html;
+};
+
 const fmtDate = (ts) => {
   if (!ts) return '';
   return new Date(ts * 1000).toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
@@ -528,7 +550,8 @@ function renderAI(content) {
     div.innerHTML = `<div class="who">${m.role === 'user' ? 'You' : 'Assistant'}</div>`;
     const body = document.createElement('div');
     body.className = 'body';
-    body.textContent = m.content || '';
+    if (m.role === 'assistant') body.innerHTML = renderMarkdown(m.content);
+    else body.textContent = m.content || '';
     div.appendChild(body);
     if (m.trace && m.trace.length) {
       const tools = document.createElement('div');
@@ -663,6 +686,15 @@ function renderAI(content) {
     let bubble = null;
     let bodyEl = null;
     let started = false;
+    let streamText = '';
+    let renderPending = false;
+
+    const renderLive = () => {
+      renderPending = false;
+      const b = ensureBubble();
+      b.innerHTML = renderMarkdown(streamText);
+      history.scrollTop = history.scrollHeight;
+    };
 
     const ensureBubble = () => {
       if (bubble) return bodyEl;
@@ -702,10 +734,13 @@ function renderAI(content) {
           }
         },
         onContent: (chunk) => {
-          const b = ensureBubble();
-          if (!started) { b.innerHTML = ''; started = true; }
-          b.appendChild(document.createTextNode(chunk));
-          history.scrollTop = history.scrollHeight;
+          ensureBubble();
+          started = true;
+          streamText += chunk;
+          if (!renderPending) {
+            renderPending = true;
+            requestAnimationFrame(renderLive);
+          }
         },
         onTool: addToolChip,
       });

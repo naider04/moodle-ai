@@ -37,6 +37,9 @@ an allow-list of the ~250 functions the official app uses.
 - **Bring your own LLM** — configure any OpenAI-compatible provider (NVIDIA
   NIM, OpenCode, etc.) by name, base URL, API key and model, then switch
   between them from the AI tab. Built-in NVIDIA provider is seeded from env.
+- **Markdown AI replies** — assistant answers are rendered as markdown
+  (headings, lists, tables, code…) with sanitized, clickable links that open
+  in a new tab.
 
 ## Run locally
 
