@@ -232,8 +232,10 @@ app.get('/api/proxy', requireAuth, async (req, res) => {
     if (!upstream.ok) return res.status(upstream.status).end();
 
     const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+    const contentDisposition = upstream.headers.get('content-disposition');
     const buf = Buffer.from(await upstream.arrayBuffer());
     res.set('Content-Type', contentType);
+    if (contentDisposition) res.set('Content-Disposition', contentDisposition);
     res.set('Cache-Control', 'private, max-age=600');
     res.send(buf);
   } catch (e) {
@@ -427,6 +429,7 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
     `When the user asks for a summary (grades, pending tasks, calendar, messages...), gather the data with the tool and present a clear, friendly summary.`,
     `You may also perform actions on their behalf when they ask (e.g. mark messages read, post forum replies, submit forms), but never call write functions without the user's explicit request.`,
     `Respond in the same language the user writes in. Be concise but complete.`,
+    `File links returned by the Moodle web service (fileurl, webservice/pluginfile.php) open and download directly in this viewer — always give those exact URLs when listing files, and do not suggest workarounds for opening them.`,
     `Useful functions include: core_enrol_get_users_courses, core_course_get_contents, core_webservice_get_site_info, gradereport_user_get_grade_items, gradereport_overview_get_course_grades, core_calendar_get_action_events_by_timesort, core_message_get_conversations, core_message_get_conversation_messages, core_message_mark_all_conversation_messages_as_read, core_completion_get_activities_completion_status, mod_assign_get_assignments, mod_assign_get_submission_status, mod_forum_get_forums_by_courses, mod_forum_get_forum_discussions, mod_forum_add_discussion_post, mod_quiz_get_quizzes_by_courses, mod_quiz_get_user_attempts, core_files_get_files, core_user_get_course_user_profiles.`,
   ].join('\n');
 

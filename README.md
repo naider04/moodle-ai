@@ -40,6 +40,11 @@ an allow-list of the ~250 functions the official app uses.
 - **Markdown AI replies** — assistant answers are rendered as markdown
   (headings, lists, tables, code…) with sanitized, clickable links that open
   in a new tab.
+- **Downloadable Moodle files** — file links the assistant returns
+  (`webservice/pluginfile.php` etc.) are rewritten through the app's token
+  proxy, so attachments (submissions, PDFs) download with one click. This
+  works on any Moodle site you log in with — the site host and token always
+  come from your current session.
 
 ## Run locally
 

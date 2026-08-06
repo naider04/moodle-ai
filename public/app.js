@@ -98,10 +98,16 @@ if (window.marked) {
     gfm: true,
     breaks: true,
     renderer: {
-      // Open links in a new tab, safely.
+      // Open links in a new tab, safely; route Moodle file URLs through the
+      // token proxy so attachments are downloadable straight from the chat.
       link({ href, title, tokens }) {
         const text = this.parser.parseInline(tokens);
-        return `<a href="${href}" target="_blank" rel="noopener noreferrer"${title ? ` title="${title}"` : ''}>${text}</a>`;
+        const target = moodleFileUrl(href);
+        return `<a href="${target}" target="_blank" rel="noopener noreferrer"${title ? ` title="${esc(title)}"` : ''}>${text}</a>`;
+      },
+      image({ href, title, text }) {
+        const src = moodleFileUrl(href);
+        return `<img src="${src}" alt="${esc(text)}"${title ? ` title="${esc(title)}"` : ''}>`;
       },
     },
   });
@@ -129,6 +135,25 @@ function img(url) {
   try {
     if (new URL(url).host === new URL(state.siteUrl).host) {
       return `/api/proxy?u=${encodeURIComponent(url)}`;
+    }
+  } catch { /* not a url */ }
+  return url;
+}
+
+/**
+ * Rewrite Moodle file URLs (pluginfile.php etc.) to our token proxy so
+ * attachments are downloadable straight from the chat. Non-Moodle links and
+ * other hosts are left untouched.
+ */
+function moodleFileUrl(url) {
+  if (!url || !state.siteUrl) return url;
+  try {
+    const u = new URL(url, state.siteUrl); // resolves relative paths too
+    if (
+      u.host === new URL(state.siteUrl).host &&
+      /(^|\/)(webservice\/)?(pluginfile|draftfile)\.php\//.test(u.pathname)
+    ) {
+      return `/api/proxy?u=${encodeURIComponent(u.href)}`;
     }
   } catch { /* not a url */ }
   return url;
