@@ -253,6 +253,15 @@ app.get('/api/proxy', requireAuth, async (req, res) => {
     const siteHost = new URL(req.session.siteUrl).host;
     if (url.host !== siteHost) return res.status(403).json({ error: 'host not allowed' });
 
+    // The site-root /pluginfile.php needs a browser session cookie, not a web
+    // service token, so it returns the login HTML page for token-based clients
+    // (e.g. generated course thumbnails /course/generated/course.svg). The
+    // official mobile app always uses /webservice/pluginfile.php, which honors
+    // the token — rewrite to that variant so avatar/course images load.
+    if (url.pathname === '/pluginfile.php' || url.pathname.startsWith('/pluginfile.php/')) {
+      url.pathname = url.pathname.replace(/^\/pluginfile\.php/, '/webservice/pluginfile.php');
+    }
+
     url.searchParams.set('token', req.session.token);
     const upstream = await fetch(url, { redirect: 'follow' });
     if (!upstream.ok) return res.status(upstream.status).end();

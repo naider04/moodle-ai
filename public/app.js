@@ -285,7 +285,7 @@ function courseCards(courses) {
   if (!courses.length) return '<div class="empty-state">No courses.</div>';
   return courses.map((c) => `
     <div class="card course-card" onclick="navigate('course', { course: ${c.id} })">
-      <div class="course-cover">${c.courseimage ? `<img src="${esc(img(c.courseimage))}" alt="" loading="lazy" />` : ''}</div>
+      <div class="course-cover">${c.courseimage ? `<img src="${esc(img(c.courseimage))}" alt="" loading="lazy" onerror="this.style.display='none'" />` : ''}</div>
       <div class="course-body">
         <h3>${esc(c.displayname || c.fullname)}</h3>
         <div class="course-meta">${esc(c.coursecategory || c.category || '')}${c.enddate ? ` · ends ${fmtDate(c.enddate)}` : ''}</div>
