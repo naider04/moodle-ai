@@ -338,6 +338,8 @@ input:focus, select:focus, textarea:focus {
 .ai-input-bar { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); }
 .ai-input-bar textarea { flex: 1; resize: none; min-height: 44px; }
 .ai-input-bar .btn { width: auto; padding: 0 20px; }
+.ai-input-bar .btn.stop { background: var(--err); color: #fff; font-weight: 700; }
+.stopped-note { margin-top: 10px; font-size: 12px; color: var(--text-dim); font-style: italic; }
 .ai-suggestions { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 12px 12px; }
 .ai-suggestion { font-size: 12px; color: var(--accent-dark); background: #fdf0e3; border: 1px solid #f5d9b8; border-radius: 14px; padding: 5px 12px; cursor: pointer; }
 .ai-suggestion:hover { background: #fbe3c9; }

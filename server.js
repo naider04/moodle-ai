@@ -504,9 +504,14 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
     res.write(`data: ${JSON.stringify(payload)}\n\n`);
   };
 
-  // Abort the upstream fetch if the browser disconnects.
+  // Abort the upstream fetch if the browser disconnects, and stop the loop so
+  // we don't keep spending tokens for a client that pressed Stop.
   const upstream = { controller: null };
-  req.on('close', () => upstream.controller && upstream.controller.abort());
+  let disconnected = false;
+  req.on('close', () => {
+    disconnected = true;
+    upstream.controller && upstream.controller.abort();
+  });
 
   /** Execute tool calls, stream their traces, and push results into history. */
   async function runTools(calls) {
@@ -559,6 +564,7 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
 
   try {
     for (let turn = 0; turn < AI_MAX_TURNS; turn++) {
+      if (disconnected) break;
       const controller = new AbortController();
       upstream.controller = controller;
 

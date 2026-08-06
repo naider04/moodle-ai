@@ -41,6 +41,7 @@ async function streamAI(messages, handlers) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ messages }),
+    signal: handlers.signal,
   });
   if (res.status === 401) {
     showLogin();
@@ -726,6 +727,22 @@ function renderAI(content) {
     noProvBox.textContent = `Could not load AI providers: ${e.message}`;
   });
 
+  let abortCtrl = null;
+  const setSendButton = () => {
+    const btn = $('#ai-send');
+    if (state.aiBusy) {
+      btn.textContent = '⏹';
+      btn.title = 'Stop generating';
+      btn.classList.add('stop');
+      btn.disabled = false;
+    } else {
+      btn.textContent = 'Send';
+      btn.title = '';
+      btn.classList.remove('stop');
+      btn.disabled = !state.providers.length;
+    }
+  };
+
   const send = async () => {
     const input = $('#ai-input');
     const text = input.value.trim();
@@ -736,7 +753,8 @@ function renderAI(content) {
     saveAIMessages();
 
     state.aiBusy = true;
-    $('#ai-send').disabled = true;
+    abortCtrl = new AbortController();
+    setSendButton();
 
     let bubble = null;
     let bodyEl = null;
@@ -782,6 +800,7 @@ function renderAI(content) {
 
     try {
       const outcome = await streamAI(state.aiMessages, {
+        signal: abortCtrl.signal,
         onStatus: (status) => {
           if (status === 'thinking' && !started) {
             const b = ensureBubble();
@@ -804,17 +823,36 @@ function renderAI(content) {
       renderMsg({ role: 'assistant', content: outcome.reply || '', trace: outcome.trace });
       saveAIMessages();
     } catch (e) {
-      if (bubble) bubble.remove();
-      renderMsg({ role: 'assistant', content: `⚠️ ${e.message}` });
+      if (e && e.name === 'AbortError') {
+        // User pressed Stop — keep whatever was streamed so far.
+        const partial = streamText || '';
+        if (bubble) {
+          bodyEl.innerHTML = (partial ? renderMarkdown(partial) : '') + '<div class="stopped-note">⏹ Stopped</div>';
+          history.scrollTop = history.scrollHeight;
+        } else {
+          renderMsg({ role: 'assistant', content: partial ? `${partial}\n\n_⏹ Stopped._` : '_⏹ Stopped._' });
+        }
+        state.aiMessages.push({ role: 'assistant', content: partial + (partial ? '\n\n' : '') + '_⏹ Stopped._', trace: [] });
+      } else {
+        if (bubble) bubble.remove();
+        renderMsg({ role: 'assistant', content: `⚠️ ${e.message}` });
+      }
       saveAIMessages();
     } finally {
       state.aiBusy = false;
-      $('#ai-send').disabled = !state.providers.length;
+      abortCtrl = null;
+      setSendButton();
       $('#ai-input').focus();
     }
   };
 
-  $('#ai-send').addEventListener('click', send);
+  $('#ai-send').addEventListener('click', () => {
+    if (state.aiBusy) {
+      if (abortCtrl) abortCtrl.abort();
+    } else {
+      send();
+    }
+  });
   $('#ai-input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); } });
   document.querySelectorAll('.ai-suggestion').forEach((el) =>
     el.addEventListener('click', () => {
