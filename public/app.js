@@ -235,8 +235,10 @@ function navigate(view, params = {}) {
     calendar: renderCalendar,
     messages: renderMessages,
     ai: renderAI,
+    course: renderCourseView,
   };
-  (routes[view] || renderDashboard)(content).catch((e) => {
+  const render = routes[view] || renderDashboard;
+  Promise.resolve(render(content, state.courseDetail)).catch((e) => {
     content.innerHTML = `<div class="error-box">${esc(e.message)}</div>`;
   });
 }
