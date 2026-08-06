@@ -85,6 +85,22 @@ function normalizeSiteUrl(raw) {
   }
 }
 
+/** When a Moodle endpoint returns HTML instead of JSON (a block page, an SSO /
+ * firewall redirect, a maintenance page, a 404 landing page…), describe it so the
+ * user sees *what* the site sent instead of a cryptic JSON-parse error. */
+function describeNonJsonResponse(res, text) {
+  const ctype = (res.headers.get('content-type') || '').split(';')[0].trim() || 'unknown';
+  const titleMatch = String(text).match(/<title[^>]*>([^<]*)<\/title>/i);
+  const title = titleMatch ? titleMatch[1].trim() : '';
+  const snippet = String(text).replace(/\s+/g, ' ').trim().slice(0, 140);
+  const parts = [
+    `got ${ctype} (HTTP ${res.status})`,
+    title ? `page title: "${title}"` : '',
+    snippet ? `starts with: ${snippet}` : '',
+  ].filter(Boolean);
+  return `the site returned an HTML page instead of the Moodle API (${parts.join('; ')}). This usually means the site blocks web-service login, is behind SSO/firewall, is in maintenance, or the URL is not a Moodle API endpoint.`;
+}
+
 /** Call a Moodle web service function using a user token. */
 async function moodleCall(siteUrl, token, wsfunction, params = {}) {
   const url = `${siteUrl}/webservice/rest/server.php?moodlewsrestformat=json`;
@@ -97,7 +113,9 @@ async function moodleCall(siteUrl, token, wsfunction, params = {}) {
   try {
     data = JSON.parse(text);
   } catch {
-    throw new Error(`Moodle returned non-JSON (HTTP ${res.status})`);
+    const err = new Error(`Moodle web service error: ${describeNonJsonResponse(res, text)}`);
+    err.status = 502;
+    throw err;
   }
   if (data.errorcode || data.exception) {
     const err = new Error(data.message || data.errorcode || 'Moodle web service error');
@@ -115,7 +133,15 @@ async function moodleLogin(siteUrl, username, password) {
     method: 'POST',
     body: new URLSearchParams({ username, password, service: WS_SERVICE }),
   });
-  const data = await res.json();
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    const err = new Error(`Login failed: ${describeNonJsonResponse(res, text)}`);
+    err.status = 502;
+    throw err;
+  }
   if (!data || !data.token) {
     const err = new Error((data && data.error) || 'Invalid username or password');
     err.status = 401;
