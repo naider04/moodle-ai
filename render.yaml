@@ -1,0 +1,27 @@
+# Render blueprint — deploy this repo on Render as a Web Service.
+# Push to GitHub, then: New + Blueprint / or create a Web Service pointing at the repo.
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: moodle-viewer
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: DEFAULT_SITE
+        value: https://aulagradoa.unemi.edu.ec
+      # Optional: pre-fill the username on the login form
+      - key: DEFAULT_USERNAME
+        value: wpatinoc
+        sync: false
+      # Your NVIDIA NIM API key for the AI assistant — set it in the Render dashboard
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: AI_MODEL
+        value: stepfun-ai/step-3.7-flash

@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Moodle Viewer</title>
+  <link rel="stylesheet" href="style.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='20' fill='%23f98012'/%3E%3Ctext x='50' y='68' font-size='52' text-anchor='middle' fill='white' font-family='Arial'%3EM%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+  <!-- Login screen -->
+  <div id="login-view" class="login-view hidden">
+    <div class="login-card">
+      <div class="login-logo">M</div>
+      <h1>Moodle Viewer</h1>
+      <p class="login-subtitle">A desktop-grade viewer for your Moodle courses</p>
+      <form id="login-form" autocomplete="on">
+        <label>
+          <span>Site URL</span>
+          <input type="text" id="login-site" placeholder="https://your-moodle.example.com" required />
+        </label>
+        <label>
+          <span>Username</span>
+          <input type="text" id="login-username" autocomplete="username" required />
+        </label>
+        <label>
+          <span>Password</span>
+          <input type="password" id="login-password" autocomplete="current-password" required />
+        </label>
+        <button type="submit" id="login-btn">Sign in</button>
+        <p class="login-error" id="login-error"></p>
+        <p class="login-note">Uses the same web service API as the official Moodle app. Credentials are sent only to your Moodle server and never stored.</p>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main app -->
+  <div id="app-view" class="app-view hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <div class="login-logo small">M</div>
+        <span>Moodle Viewer</span>
+      </div>
+      <nav class="sidebar-nav">
+        <button class="nav-item active" data-view="dashboard">
+          <span class="nav-icon">&#9632;</span> Dashboard
+        </button>
+        <button class="nav-item" data-view="courses">
+          <span class="nav-icon">&#9783;</span> Courses
+        </button>
+        <button class="nav-item" data-view="grades">
+          <span class="nav-icon">&#9733;</span> Grades
+        </button>
+        <button class="nav-item" data-view="calendar">
+          <span class="nav-icon">&#9737;</span> Calendar
+        </button>
+        <button class="nav-item" data-view="messages">
+          <span class="nav-icon">&#9993;</span> Messages
+          <span class="badge hidden" id="msg-badge">0</span>
+        </button>
+        <button class="nav-item" data-view="ai" id="ai-nav-item">
+          <span class="nav-icon">&#10035;</span> AI Assistant
+        </button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="user-chip">
+          <img id="user-avatar" alt="" />
+          <div class="user-meta">
+            <strong id="user-name"></strong>
+            <span id="user-site"></span>
+          </div>
+        </div>
+        <button class="nav-item" id="logout-btn"><span class="nav-icon">&#8617;</span> Sign out</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <h2 id="view-title">Dashboard</h2>
+        <div class="topbar-actions">
+          <button class="btn ghost" id="refresh-btn">&#8635; Refresh</button>
+        </div>
+      </header>
+      <div id="content" class="content">
+        <div class="loader" id="loader">Loading…</div>
+      </div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "name": "moodle-viewer",
+  "version": "1.0.0",
+  "description": "Desktop-grade Moodle viewer for the web. Mirrors the official Moodle mobile app's web service API and adds an AI assistant agent with full access to your Moodle account.",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0"
+  }
+}

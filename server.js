@@ -1,0 +1,754 @@
+/**
+ * Moodle Viewer — server
+ *
+ * A small Node/Express backend that speaks the same Moodle web service API the
+ * official Moodle mobile app uses, plus an AI assistant endpoint (NVIDIA API)
+ * that can drive your Moodle account through tool calls.
+ *
+ * Endpoints used by the frontend:
+ *   POST /api/login        { siteUrl, username, password } -> login/token.php
+ *   GET  /api/me           current session user
+ *   POST /api/logout
+ *   POST /api/ws           { wsfunction, params } -> webservice/rest/server.php
+ *   GET  /api/proxy?u=URL  proxy moodle-hosted files (adds the auth token)
+ *   POST /api/ai/chat      { messages } -> NVIDIA chat completions with tools
+ *   GET  /api/config       non-secret bootstrap config for the login form
+ *   GET  /api/health
+ */
+'use strict';
+
+require('dotenv').config();
+
+const path = require('path');
+const express = require('express');
+const session = require('express-session');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const WS_SERVICE = process.env.WS_SERVICE || 'moodle_mobile_app';
+
+app.use(express.json({ limit: '1mb' }));
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET || 'moodle-viewer-dev-secret-change-me',
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: 'lax',
+      maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
+    },
+  }),
+);
+
+/* ------------------------------------------------------------------ *
+ * Helpers
+ * ------------------------------------------------------------------ */
+
+/** Flatten nested objects/arrays into Moodle REST-style params. */
+function flattenParams(obj, prefix = '', out = {}) {
+  if (obj === null || obj === undefined) {
+    if (prefix) out[prefix] = '';
+    return out;
+  }
+  if (typeof obj !== 'object') {
+    out[prefix] = obj;
+    return out;
+  }
+  if (Array.isArray(obj)) {
+    obj.forEach((v, i) => flattenParams(v, `${prefix}[${i}]`, out));
+    return out;
+  }
+  for (const [k, v] of Object.entries(obj)) {
+    flattenParams(v, prefix ? `${prefix}[${k}]` : k, out);
+  }
+  return out;
+}
+
+/** Validate a site URL and normalize it to https://host form. */
+function normalizeSiteUrl(raw) {
+  if (!raw) return null;
+  let url = String(raw).trim().replace(/\/+$/, '');
+  if (!/^https?:\/\//i.test(url)) url = `https://${url}`;
+  try {
+    const u = new URL(url);
+    if (!u.hostname.includes('.')) return null;
+    return u.origin;
+  } catch {
+    return null;
+  }
+}
+
+/** Call a Moodle web service function using a user token. */
+async function moodleCall(siteUrl, token, wsfunction, params = {}) {
+  const url = `${siteUrl}/webservice/rest/server.php?moodlewsrestformat=json`;
+  const body = new URLSearchParams(
+    flattenParams({ wsfunction, wstoken: token, ...params }),
+  );
+  const res = await fetch(url, { method: 'POST', body });
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`Moodle returned non-JSON (HTTP ${res.status})`);
+  }
+  if (data.errorcode || data.exception) {
+    const err = new Error(data.message || data.errorcode || 'Moodle web service error');
+    err.status = 400;
+    err.details = data;
+    throw err;
+  }
+  return data;
+}
+
+/** Request a user token via /login/token.php (same as the mobile app). */
+async function moodleLogin(siteUrl, username, password) {
+  const loginUrl = `${siteUrl}/login/token.php?lang=en`;
+  const res = await fetch(loginUrl, {
+    method: 'POST',
+    body: new URLSearchParams({ username, password, service: WS_SERVICE }),
+  });
+  const data = await res.json();
+  if (!data || !data.token) {
+    const err = new Error((data && data.error) || 'Invalid username or password');
+    err.status = 401;
+    throw err;
+  }
+  return { token: data.token, privateToken: data.privatetoken || '' };
+}
+
+/** 401 unless a session with a Moodle token exists. */
+function requireAuth(req, res, next) {
+  if (req.session && req.session.token && req.session.siteUrl) return next();
+  return res.status(401).json({ error: 'Not logged in' });
+}
+
+/* ------------------------------------------------------------------ *
+ * Auth
+ * ------------------------------------------------------------------ */
+
+app.post('/api/login', async (req, res) => {
+  try {
+    const siteUrl = normalizeSiteUrl(req.body.siteUrl);
+    const username = String(req.body.username || '').trim();
+    const password = String(req.body.password || '');
+    if (!siteUrl) return res.status(400).json({ error: 'Invalid site URL' });
+    if (!username || !password) return res.status(400).json({ error: 'Username and password are required' });
+
+    const { token } = await moodleLogin(siteUrl, username, password);
+    const info = await moodleCall(siteUrl, token, 'core_webservice_get_site_info');
+
+    req.session.siteUrl = siteUrl;
+    req.session.token = token;
+    req.session.user = {
+      id: info.userid,
+      username: info.username,
+      firstname: info.firstname,
+      lastname: info.lastname,
+      fullname: info.fullname,
+      picture: info.userpictureurl || null,
+      lang: info.lang || 'en',
+      sitename: info.sitename,
+      release: info.release,
+    };
+    await new Promise((resolve) => req.session.save(resolve));
+    res.json({ ok: true, user: req.session.user });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message || 'Login failed' });
+  }
+});
+
+app.post('/api/logout', (req, res) => {
+  req.session.destroy(() => res.json({ ok: true }));
+});
+
+app.get('/api/me', (req, res) => {
+  if (req.session && req.session.user) {
+    res.json({ user: req.session.user, siteUrl: req.session.siteUrl });
+  } else {
+    res.status(401).json({ error: 'Not logged in' });
+  }
+});
+
+app.get('/api/config', (req, res) => {
+  res.json({
+    defaultSite: process.env.DEFAULT_SITE || '',
+    defaultUsername: process.env.DEFAULT_USERNAME || '',
+    aiConfigured: Boolean(process.env.NVIDIA_API_KEY),
+  });
+});
+
+app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+/* ------------------------------------------------------------------ *
+ * Moodle web service proxy
+ * ------------------------------------------------------------------ */
+
+app.post('/api/ws', requireAuth, async (req, res) => {
+  try {
+    const { wsfunction, params } = req.body;
+    if (!wsfunction) return res.status(400).json({ error: 'wsfunction is required' });
+    // Only allow functions the official app uses (safety net for the AI agent too).
+    const allowed = ALLOWED_FUNCTIONS;
+    if (!allowed.includes(wsfunction)) {
+      return res.status(403).json({ error: `Function ${wsfunction} is not allowed` });
+    }
+    const p = params || {};
+    // The official app sends userid=0 (or omits it) to mean "current user", but
+    // some Moodle versions require the explicit id. Substitute the session id.
+    if (USERID_DEFAULT_FUNCTIONS.has(wsfunction) && (p.userid === undefined || p.userid === 0)) {
+      p.userid = req.session.user.id;
+    }
+    const data = await moodleCall(req.session.siteUrl, req.session.token, wsfunction, p);
+    res.json(data);
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message || 'Web service call failed', details: e.details });
+  }
+});
+
+/** Proxy moodle-hosted files (course images, avatars, attachments). */
+app.get('/api/proxy', requireAuth, async (req, res) => {
+  try {
+    const raw = req.query.u;
+    if (!raw) return res.status(400).json({ error: 'missing u' });
+    let url;
+    try {
+      url = new URL(String(raw));
+    } catch {
+      return res.status(400).json({ error: 'bad url' });
+    }
+    const siteHost = new URL(req.session.siteUrl).host;
+    if (url.host !== siteHost) return res.status(403).json({ error: 'host not allowed' });
+
+    url.searchParams.set('token', req.session.token);
+    const upstream = await fetch(url, { redirect: 'follow' });
+    if (!upstream.ok) return res.status(upstream.status).end();
+
+    const contentType = upstream.headers.get('content-type') || 'application/octet-stream';
+    const buf = Buffer.from(await upstream.arrayBuffer());
+    res.set('Content-Type', contentType);
+    res.set('Cache-Control', 'private, max-age=600');
+    res.send(buf);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * AI assistant (NVIDIA API) with a Moodle tool
+ * ------------------------------------------------------------------ */
+
+const AI_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
+const AI_MODEL = process.env.AI_MODEL || 'stepfun-ai/step-3.7-flash';
+const AI_MAX_TURNS = parseInt(process.env.AI_MAX_TURNS || '8', 10);
+
+const MOODLE_TOOL = {
+  type: 'function',
+  function: {
+    name: 'moodle_ws',
+    description:
+      'Call a Moodle web service function on behalf of the logged-in user. Use this to read (and, when the user asks, modify) anything in their Moodle account: courses, contents, grades, calendar, messages, forums, assignments, quizzes, files, etc. Only functions from the official Moodle mobile app are allowed.',
+    parameters: {
+      type: 'object',
+      properties: {
+        function: {
+          type: 'string',
+          description: 'Moodle web service function name, e.g. core_enrol_get_users_courses',
+        },
+        params: {
+          type: 'object',
+          description: 'Function parameters (userid defaults to the logged-in user when omitted).',
+          additionalProperties: true,
+        },
+      },
+      required: ['function'],
+    },
+  },
+};
+
+/** Keep only fields the chat API accepts when replaying an assistant turn. */
+function sanitizeAssistantMessage(msg) {
+  const clean = { role: 'assistant' };
+  if (msg.content !== undefined && msg.content !== null) clean.content = msg.content;
+  if (msg.tool_calls && msg.tool_calls.length) clean.tool_calls = msg.tool_calls;
+  return clean;
+}
+
+app.post('/api/ai/chat', requireAuth, async (req, res) => {
+  if (!process.env.NVIDIA_API_KEY) {
+    return res.status(503).json({ error: 'AI is not configured (missing NVIDIA_API_KEY env var).' });
+  }
+
+  const incoming = Array.isArray(req.body.messages) ? req.body.messages : [];
+  if (!incoming.length) return res.status(400).json({ error: 'messages is required' });
+
+  const user = req.session.user;
+  const system = [
+    `You are the AI assistant inside a desktop Moodle viewer.`,
+    `The logged-in user is ${user.fullname} (${user.username}) on the Moodle site ${req.session.siteUrl} (${user.sitename || ''}).`,
+    `You have full access to their Moodle account through the "moodle_ws" tool. Whenever you need any data from Moodle, call the tool with the right function name and params.`,
+    `When the user asks for a summary (grades, pending tasks, calendar, messages...), gather the data with the tool and present a clear, friendly summary.`,
+    `You may also perform actions on their behalf when they ask (e.g. mark messages read, post forum replies, submit forms), but never call write functions without the user's explicit request.`,
+    `Respond in the same language the user writes in. Be concise but complete.`,
+    `Useful functions include: core_enrol_get_users_courses, core_course_get_contents, core_webservice_get_site_info, gradereport_user_get_grade_items, gradereport_overview_get_course_grades, core_calendar_get_action_events_by_timesort, core_message_get_conversations, core_message_get_conversation_messages, core_message_mark_all_conversation_messages_as_read, core_completion_get_activities_completion_status, mod_assign_get_assignments, mod_assign_get_submission_status, mod_forum_get_forums_by_courses, mod_forum_get_forum_discussions, mod_forum_add_discussion_post, mod_quiz_get_quizzes_by_courses, mod_quiz_get_user_attempts, core_files_get_files, core_user_get_course_user_profiles.`,
+  ].join('\n');
+
+  const history = [{ role: 'system', content: system }, ...incoming];
+  const trace = [];
+
+  try {
+    for (let turn = 0; turn < AI_MAX_TURNS; turn++) {
+      const response = await fetch(AI_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model: AI_MODEL,
+          messages: history,
+          tools: [MOODLE_TOOL],
+          temperature: 0.3,
+          max_tokens: 4000,
+          stream: false,
+        }),
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`AI API error ${response.status}: ${text.slice(0, 500)}`);
+      }
+
+      const data = await response.json();
+      const msg = data.choices?.[0]?.message;
+      if (!msg) throw new Error('AI API returned an empty response');
+
+      history.push(sanitizeAssistantMessage(msg));
+
+      const calls = msg.tool_calls || [];
+      if (!calls.length) {
+        return res.json({ reply: msg.content || '', trace });
+      }
+
+      for (const call of calls) {
+        let args = {};
+        try {
+          args = JSON.parse(call.function.arguments || '{}');
+        } catch {
+          args = {};
+        }
+        const fn = args.function;
+        const toolParams = args.params || {};
+        if (USERID_DEFAULT_FUNCTIONS.has(fn) && (toolParams.userid === undefined || toolParams.userid === 0)) {
+          toolParams.userid = req.session.user.id;
+        }
+        if (!ALLOWED_FUNCTIONS.includes(fn)) {
+          trace.push({ function: fn, ok: false, error: 'Function not allowed' });
+          history.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            content: JSON.stringify({ error: `Function ${fn} is not available` }),
+          });
+          continue;
+        }
+        try {
+          const result = await moodleCall(req.session.siteUrl, req.session.token, fn, toolParams);
+          trace.push({ function: fn, params: toolParams, ok: true });
+          const payload = JSON.stringify(result);
+          history.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            content: payload.length > 60000 ? payload.slice(0, 60000) : payload,
+          });
+        } catch (e) {
+          trace.push({ function: fn, params: toolParams, ok: false, error: e.message });
+          history.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            content: JSON.stringify({ error: e.message }),
+          });
+        }
+      }
+    }
+
+    res.json({ reply: 'I could not finish answering in time. Please try a simpler question.', trace });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * Static frontend
+ * ------------------------------------------------------------------ */
+
+app.use(express.static(path.join(__dirname, 'public')));
+
+app.get('*', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+app.listen(PORT, () => {
+  console.log(`Moodle Viewer running on http://localhost:${PORT}`);
+});
+
+/* ------------------------------------------------------------------ *
+ * Allow-list of Moodle web service functions (mirrors the official app)
+ * ------------------------------------------------------------------ */
+
+/** Functions where userid=0/omitted means "the current user". */
+const USERID_DEFAULT_FUNCTIONS = new Set([
+  'core_enrol_get_users_courses',
+  'core_course_get_enrolled_courses_by_timeline_classification',
+  'core_course_get_recent_courses',
+  'gradereport_user_get_grades_table',
+  'gradereport_user_get_grade_items',
+  'gradereport_overview_get_course_grades',
+  'core_completion_get_course_completion_status',
+  'core_calendar_get_calendar_events',
+  'core_user_get_course_user_profiles',
+  'core_notes_get_course_notes',
+  'core_message_get_conversations',
+  'core_message_get_unread_conversation_counts',
+  'core_message_get_conversation_counts',
+  'core_message_get_messages',
+  'core_message_get_user_contacts',
+  'core_message_get_contact_requests',
+  'core_user_get_private_files_info',
+  'core_user_get_user_preferences',
+  'core_badges_get_user_badges',
+]);
+
+const ALLOWED_FUNCTIONS = [
+  'core_webservice_get_site_info',
+  'core_enrol_get_users_courses',
+  'core_enrol_get_course_enrolment_methods',
+  'core_course_get_contents',
+  'core_course_get_courses',
+  'core_course_get_courses_by_field',
+  'core_course_get_course_module',
+  'core_course_get_course_module_by_instance',
+  'core_course_get_enrolled_courses_by_timeline_classification',
+  'core_course_get_recent_courses',
+  'core_course_get_user_navigation_options',
+  'core_course_get_user_administration_options',
+  'core_course_check_updates',
+  'core_course_search_courses',
+  'core_course_set_favourite_courses',
+  'core_course_view_course',
+  'core_course_view_module_instance_list',
+  'core_courseformat_get_overview_information',
+  'core_completion_get_activities_completion_status',
+  'core_completion_get_course_completion_status',
+  'core_completion_mark_course_self_completed',
+  'core_completion_update_activity_completion_status_manually',
+  'core_calendar_get_calendar_monthly_view',
+  'core_calendar_get_calendar_day_view',
+  'core_calendar_get_calendar_upcoming_view',
+  'core_calendar_get_calendar_events',
+  'core_calendar_get_calendar_event_by_id',
+  'core_calendar_get_action_events_by_timesort',
+  'core_calendar_get_action_events_by_course',
+  'core_calendar_get_action_events_by_courses',
+  'core_calendar_create_calendar_events',
+  'core_calendar_delete_calendar_events',
+  'core_message_get_conversations',
+  'core_message_get_conversation',
+  'core_message_get_conversation_between_users',
+  'core_message_get_conversation_messages',
+  'core_message_get_conversation_counts',
+  'core_message_get_unread_conversation_counts',
+  'core_message_get_messages',
+  'core_message_get_member_info',
+  'core_message_get_user_contacts',
+  'core_message_send_instant_messages',
+  'core_message_send_messages_to_conversation',
+  'core_message_mark_all_conversation_messages_as_read',
+  'core_message_mark_all_notifications_as_read',
+  'core_message_mark_message_read',
+  'core_message_mark_notification_read',
+  'core_message_get_unread_notification_count',
+  'core_message_search_contacts',
+  'core_message_message_search_users',
+  'core_message_delete_message',
+  'core_message_delete_conversations_by_id',
+  'core_message_block_user',
+  'core_message_unblock_user',
+  'core_message_mute_conversations',
+  'core_message_unmute_conversations',
+  'core_message_set_favourite_conversations',
+  'core_message_unset_favourite_conversations',
+  'core_message_create_contact_request',
+  'core_message_confirm_contact_request',
+  'core_message_decline_contact_request',
+  'core_message_delete_contacts',
+  'core_message_get_contact_requests',
+  'core_message_get_received_contact_requests_count',
+  'core_grades_get_gradeitems',
+  'gradereport_user_get_grades_table',
+  'gradereport_user_get_grade_items',
+  'gradereport_user_get_access_information',
+  'gradereport_user_view_grade_report',
+  'gradereport_overview_get_course_grades',
+  'gradereport_overview_view_grade_report',
+  'core_user_get_course_user_profiles',
+  'core_user_get_users_by_field',
+  'core_user_get_user_preferences',
+  'core_user_update_user_preferences',
+  'core_user_view_user_profile',
+  'core_user_view_user_list',
+  'core_user_get_private_files_info',
+  'core_user_agree_site_policy',
+  'core_files_get_files',
+  'core_files_delete_draft_files',
+  'core_notes_get_course_notes',
+  'core_notes_create_notes',
+  'core_notes_delete_notes',
+  'core_notes_view_notes',
+  'core_comment_get_comments',
+  'core_comment_add_comments',
+  'core_comment_delete_comments',
+  'core_tag_get_tag_cloud',
+  'core_tag_get_tag_collections',
+  'core_tag_get_tagindex_per_area',
+  'core_search_get_results',
+  'core_search_get_search_areas_list',
+  'core_search_view_results',
+  'core_block_get_course_blocks',
+  'core_block_get_dashboard_blocks',
+  'core_blog_get_entries',
+  'core_blog_add_entry',
+  'core_blog_delete_entry',
+  'core_blog_prepare_entry_for_edition',
+  'core_blog_update_entry',
+  'core_blog_view_entries',
+  'core_rating_get_item_ratings',
+  'core_rating_add_rating',
+  'core_question_update_flag',
+  'core_get_component_strings',
+  'core_group_get_course_user_groups',
+  'core_group_get_activity_allowed_groups',
+  'core_group_get_activity_groupmode',
+  'core_enrol_get_enrolled_users',
+  'core_enrol_search_users',
+  'enrol_self_get_instance_info',
+  'enrol_self_enrol_user',
+  'enrol_guest_get_instance_info',
+  'enrol_guest_validate_password',
+  'message_popup_get_popup_notifications',
+  'message_popup_get_unread_popup_notification_count',
+  'mod_assign_get_assignments',
+  'mod_assign_get_grades',
+  'mod_assign_get_submission_status',
+  'mod_assign_get_submissions',
+  'mod_assign_get_user_mappings',
+  'mod_assign_list_participants',
+  'mod_assign_view_assign',
+  'mod_assign_view_grading_table',
+  'mod_assign_view_submission_status',
+  'mod_assign_start_submission',
+  'mod_assign_save_submission',
+  'mod_assign_submit_for_grading',
+  'mod_assign_remove_submission',
+  'mod_book_get_books_by_courses',
+  'mod_book_view_book',
+  'mod_forum_get_forums_by_courses',
+  'mod_forum_get_forum_discussions',
+  'mod_forum_get_forum_discussions_paginated',
+  'mod_forum_get_discussion_posts',
+  'mod_forum_get_forum_discussion_posts',
+  'mod_forum_get_discussion_post',
+  'mod_forum_view_forum',
+  'mod_forum_view_forum_discussion',
+  'mod_forum_add_discussion',
+  'mod_forum_add_discussion_post',
+  'mod_forum_update_discussion_post',
+  'mod_forum_delete_post',
+  'mod_forum_can_add_discussion',
+  'mod_forum_get_forum_access_information',
+  'mod_forum_set_lock_state',
+  'mod_forum_set_pin_state',
+  'mod_forum_toggle_favourite_state',
+  'mod_quiz_get_quizzes_by_courses',
+  'mod_quiz_get_user_attempts',
+  'mod_quiz_get_user_best_grade',
+  'mod_quiz_get_attempt_data',
+  'mod_quiz_get_attempt_summary',
+  'mod_quiz_get_attempt_review',
+  'mod_quiz_get_combined_review_options',
+  'mod_quiz_get_quiz_access_information',
+  'mod_quiz_get_attempt_access_information',
+  'mod_quiz_get_quiz_required_qtypes',
+  'mod_quiz_get_quiz_feedback_for_grade',
+  'mod_quiz_start_attempt',
+  'mod_quiz_save_attempt',
+  'mod_quiz_process_attempt',
+  'mod_quiz_view_attempt',
+  'mod_quiz_view_attempt_summary',
+  'mod_quiz_view_attempt_review',
+  'mod_quiz_view_quiz',
+  'mod_resource_get_resources_by_courses',
+  'mod_resource_view_resource',
+  'mod_folder_get_folders_by_courses',
+  'mod_folder_view_folder',
+  'mod_url_get_urls_by_courses',
+  'mod_url_view_url',
+  'mod_page_get_pages_by_courses',
+  'mod_page_view_page',
+  'mod_label_get_labels_by_courses',
+  'mod_imscp_get_imscps_by_courses',
+  'mod_imscp_view_imscp',
+  'mod_lti_get_ltis_by_courses',
+  'mod_lti_get_tool_launch_data',
+  'mod_lti_view_lti',
+  'mod_glossary_get_glossaries_by_courses',
+  'mod_glossary_get_entries_by_letter',
+  'mod_glossary_get_entries_by_date',
+  'mod_glossary_get_entries_by_author',
+  'mod_glossary_get_entries_by_category',
+  'mod_glossary_get_entries_by_search',
+  'mod_glossary_get_entry_by_id',
+  'mod_glossary_get_categories',
+  'mod_glossary_add_entry',
+  'mod_glossary_update_entry',
+  'mod_glossary_delete_entry',
+  'mod_glossary_prepare_entry_for_edition',
+  'mod_glossary_view_entry',
+  'mod_glossary_view_glossary',
+  'mod_wiki_get_wikis_by_courses',
+  'mod_wiki_view_wiki',
+  'mod_wiki_view_page',
+  'mod_wiki_get_subwikis',
+  'mod_wiki_get_subwiki_pages',
+  'mod_wiki_get_subwiki_files',
+  'mod_wiki_get_page_contents',
+  'mod_wiki_get_page_for_editing',
+  'mod_wiki_new_page',
+  'mod_wiki_edit_page',
+  'mod_data_get_databases_by_courses',
+  'mod_data_view_database',
+  'mod_data_get_data_access_information',
+  'mod_data_get_entries',
+  'mod_data_get_entry',
+  'mod_data_get_fields',
+  'mod_data_search_entries',
+  'mod_data_add_entry',
+  'mod_data_update_entry',
+  'mod_data_delete_entry',
+  'mod_data_approve_entry',
+  'mod_lesson_get_lessons_by_courses',
+  'mod_lesson_get_lesson',
+  'mod_lesson_get_lesson_access_information',
+  'mod_lesson_get_pages',
+  'mod_lesson_get_page_data',
+  'mod_lesson_launch_attempt',
+  'mod_lesson_process_page',
+  'mod_lesson_finish_attempt',
+  'mod_lesson_get_user_attempt',
+  'mod_lesson_get_user_timers',
+  'mod_lesson_get_content_pages_viewed',
+  'mod_lesson_get_attempts_overview',
+  'mod_lesson_view_lesson',
+  'mod_scorm_get_scorms_by_courses',
+  'mod_scorm_view_scorm',
+  'mod_scorm_get_scorm_attempt_count',
+  'mod_scorm_get_scorm_scoes',
+  'mod_scorm_get_scorm_user_data',
+  'mod_scorm_insert_scorm_tracks',
+  'mod_scorm_launch_sco',
+  'mod_scorm_get_scorm_access_information',
+  'mod_survey_get_surveys_by_courses',
+  'mod_survey_view_survey',
+  'mod_survey_get_questions',
+  'mod_survey_submit_answers',
+  'mod_choice_get_choices_by_courses',
+  'mod_choice_view_choice',
+  'mod_choice_get_choice_options',
+  'mod_choice_get_choice_results',
+  'mod_choice_submit_choice_response',
+  'mod_choice_delete_choice_responses',
+  'mod_feedback_get_feedbacks_by_courses',
+  'mod_feedback_view_feedback',
+  'mod_feedback_get_feedback_access_information',
+  'mod_feedback_get_items',
+  'mod_feedback_launch_feedback',
+  'mod_feedback_get_page_items',
+  'mod_feedback_process_page',
+  'mod_feedback_get_analysis',
+  'mod_feedback_get_current_completed_tmp',
+  'mod_feedback_get_unfinished_responses',
+  'mod_feedback_get_finished_responses',
+  'mod_feedback_get_last_completed',
+  'mod_feedback_get_responses_analysis',
+  'mod_feedback_get_non_respondents',
+  'mod_workshop_get_workshops_by_courses',
+  'mod_workshop_view_workshop',
+  'mod_workshop_get_workshop_access_information',
+  'mod_workshop_get_user_plan',
+  'mod_workshop_view_submission',
+  'mod_workshop_add_submission',
+  'mod_workshop_update_submission',
+  'mod_workshop_delete_submission',
+  'mod_workshop_get_submissions',
+  'mod_workshop_get_submission',
+  'mod_workshop_get_submission_assessments',
+  'mod_workshop_get_reviewer_assessments',
+  'mod_workshop_get_assessment',
+  'mod_workshop_get_assessment_form_definition',
+  'mod_workshop_update_assessment',
+  'mod_workshop_get_grades',
+  'mod_workshop_evaluate_assessment',
+  'mod_workshop_get_grades_report',
+  'mod_workshop_evaluate_submission',
+  'mod_h5pactivity_get_h5pactivities_by_courses',
+  'mod_h5pactivity_view_h5pactivity',
+  'mod_h5pactivity_get_h5pactivity_access_information',
+  'mod_h5pactivity_get_attempts',
+  'mod_h5pactivity_get_results',
+  'mod_h5pactivity_get_user_attempts',
+  'mod_h5pactivity_log_report_viewed',
+  'mod_bigbluebuttonbn_get_bigbluebuttonbns_by_courses',
+  'mod_bigbluebuttonbn_view_bigbluebuttonbn',
+  'mod_bigbluebuttonbn_meeting_info',
+  'mod_bigbluebuttonbn_get_join_url',
+  'mod_bigbluebuttonbn_get_recordings',
+  'mod_bigbluebuttonbn_end_meeting',
+  'mod_bigbluebuttonbn_can_join',
+  'block_recentlyaccesseditems_get_recent_items',
+  'block_starredcourses_get_starred_courses',
+  'core_competency_list_course_competencies',
+  'tool_lp_data_for_course_competencies_page',
+  'tool_lp_data_for_plans_page',
+  'tool_lp_data_for_plan_page',
+  'tool_lp_data_for_user_competency_summary',
+  'tool_lp_data_for_user_competency_summary_in_course',
+  'tool_lp_data_for_user_competency_summary_in_plan',
+  'core_badges_get_badges',
+  'core_badges_get_user_badges',
+  'core_badges_get_badge',
+  'core_badges_get_user_badge_by_hash',
+  'core_badges_view_user_badges',
+  'core_my_view_page',
+  'core_filters_get_available_in_context',
+  'core_filters_get_all_states',
+  'core_h5p_get_trusted_h5p_file',
+  'core_xapi_statement_post',
+  'core_xapi_post_state',
+  'core_xapi_get_state',
+  'core_xapi_get_states',
+  'core_xapi_delete_state',
+  'core_reportbuilder_list_reports',
+  'core_reportbuilder_retrieve_report',
+  'core_reportbuilder_retrieve_system_report',
+  'core_reportbuilder_can_view_system_report',
+  'core_reportbuilder_view_report',
+  'core_table_get_dynamic_table_content',
+  'core_user_add_user_device',
+  'core_user_remove_user_device',
+  'core_user_update_user_device_public_key',
+  'message_airnotifier_is_system_configured',
+  'message_airnotifier_are_notification_preferences_configured',
+  'message_airnotifier_get_user_devices',
+  'message_airnotifier_enable_device',
+  'report_insights_action_executed',
+];
