@@ -251,8 +251,12 @@ const AI_MAX_TURNS = parseInt(process.env.AI_MAX_TURNS || '8', 10);
 
 /* ------------------------------------------------------------------ *
  * AI providers — OpenAI-compatible endpoints, persisted in providers.json.
- * The built-in NVIDIA provider is seeded from env vars so the app works
- * out of the box; you can add any other endpoint (e.g. OpenCode) in the UI.
+ * Two providers are seeded from env vars so the app works out of the box
+ * and you can hand users a provider without touching the UI:
+ *   - NVIDIA NIM      (NVIDIA_API_KEY / AI_MODEL / AI_ENDPOINT)
+ *   - A personal one  (AI_PROVIDER_BASE_URL + AI_PROVIDER_API_KEY, plus
+ *                      AI_PROVIDER_NAME / AI_PROVIDER_MODEL / AI_PROVIDER_DEFAULT)
+ * You can also add/switch any other endpoint (e.g. OpenCode) in the UI.
  * ------------------------------------------------------------------ */
 
 const PROVIDERS_FILE = path.join(__dirname, 'providers.json');
@@ -296,7 +300,7 @@ let providers = loadProviders();
 
 // Seed / refresh the built-in NVIDIA provider from environment variables.
 if (process.env.NVIDIA_API_KEY) {
-  const existing = providers.find((p) => p.builtin);
+  const existing = providers.find((p) => p.id === 'builtin-nvidia');
   if (existing) {
     existing.apiKey = process.env.NVIDIA_API_KEY;
     if (process.env.AI_MODEL) existing.model = process.env.AI_MODEL;
@@ -312,6 +316,48 @@ if (process.env.NVIDIA_API_KEY) {
       default: true,
       createdAt: Date.now(),
     });
+    saveProviders(providers);
+  }
+}
+
+// Seed / refresh a "personal" provider from env vars. Point it at any
+// OpenAI-compatible endpoint (NVIDIA, OpenCode, …) and swap providers later
+// by editing AI_PROVIDER_* on the server — no code or UI changes needed.
+// The provider is only created when BOTH a base URL and an API key are set.
+if (process.env.AI_PROVIDER_BASE_URL && process.env.AI_PROVIDER_API_KEY) {
+  const personal = {
+    id: 'env-personal',
+    name: process.env.AI_PROVIDER_NAME || 'Personal LLM',
+    baseUrl: String(process.env.AI_PROVIDER_BASE_URL).trim().replace(/\/+$/, ''),
+    apiKey: process.env.AI_PROVIDER_API_KEY,
+    model: process.env.AI_PROVIDER_MODEL || '',
+    builtin: true,
+    createdAt: Date.now(),
+  };
+  const idx = providers.findIndex((p) => p.id === 'env-personal');
+  if (idx !== -1) {
+    // Refresh values from env so dashboard changes take effect on redeploy.
+    providers[idx] = Object.assign({}, providers[idx], {
+      name: personal.name,
+      baseUrl: personal.baseUrl,
+      apiKey: personal.apiKey,
+      model: personal.model,
+      builtin: true,
+    });
+  } else {
+    providers.unshift(personal);
+  }
+  // Optionally make the personal provider the default for new sessions.
+  if (/^(1|true|yes|on)$/i.test(process.env.AI_PROVIDER_DEFAULT || '')) {
+    providers.forEach((p) => { p.default = p.id === 'env-personal'; });
+  }
+  saveProviders(providers);
+} else {
+  // Env vars were removed — drop the env-seeded provider so it can't linger
+  // as a stale, undeletable entry.
+  const idx = providers.findIndex((p) => p.id === 'env-personal');
+  if (idx !== -1) {
+    providers.splice(idx, 1);
     saveProviders(providers);
   }
 }

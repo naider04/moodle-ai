@@ -21,3 +21,16 @@ services:
         sync: false
       - key: AI_MODEL
         value: stepfun-ai/step-3.7-flash
+      # Optional: seed a personal provider your users can use (any OpenAI-
+      # compatible endpoint). Set the base URL + key; customize with
+      # AI_PROVIDER_NAME / AI_PROVIDER_MODEL / AI_PROVIDER_DEFAULT=1.
+      - key: AI_PROVIDER_BASE_URL
+        sync: false
+      - key: AI_PROVIDER_API_KEY
+        sync: false
+      - key: AI_PROVIDER_NAME
+        sync: false
+      - key: AI_PROVIDER_MODEL
+        sync: false
+      - key: AI_PROVIDER_DEFAULT
+        sync: false

@@ -36,7 +36,10 @@ an allow-list of the ~250 functions the official app uses.
   model reasons, tool traces shown live).
 - **Bring your own LLM** — configure any OpenAI-compatible provider (NVIDIA
   NIM, OpenCode, etc.) by name, base URL, API key and model, then switch
-  between them from the AI tab. Built-in NVIDIA provider is seeded from env.
+  between them from the AI tab. The built-in NVIDIA provider is seeded from
+  env; a **personal provider** can also be seeded from env vars
+  (`AI_PROVIDER_BASE_URL` + `AI_PROVIDER_API_KEY`) so you can hand users a
+  provider and swap it later without touching the UI.
 - **Markdown AI replies** — assistant answers are rendered as markdown
   (headings, lists, tables, code…) with sanitized, clickable links that open
   in a new tab.
@@ -73,6 +76,11 @@ password. Credentials go straight to your Moodle server; nothing is stored.
    - `DEFAULT_SITE` — your Moodle URL (optional, pre-fills the form)
    - `NVIDIA_API_KEY` — required only for the AI assistant
    - `AI_MODEL` — defaults to `stepfun-ai/step-3.7-flash`
+   - `AI_PROVIDER_BASE_URL` + `AI_PROVIDER_API_KEY` — optional; seeds a
+     **personal provider** your users can use (any OpenAI-compatible
+     endpoint). Add `AI_PROVIDER_NAME`, `AI_PROVIDER_MODEL` and
+     `AI_PROVIDER_DEFAULT=1` to customize it / make it the default.
+     Swap providers later by editing these vars and redeploying.
 
 ## API
 
@@ -95,10 +103,21 @@ password. Credentials go straight to your Moodle server; nothing is stored.
 
 Providers are OpenAI-compatible endpoints stored in `providers.json` (gitignored,
 keys stay server-side; on Render the file lives on the instance's ephemeral disk,
-so re-add providers after a redeploy). A built-in NVIDIA provider is seeded from
-`NVIDIA_API_KEY` / `AI_MODEL` / `AI_ENDPOINT` env vars. To point the assistant at
-another provider (e.g. OpenCode), add it in the AI tab with its base URL, API
-key and model name — no code changes needed.
+so re-add providers after a redeploy). Two providers can be seeded from env vars
+at boot (they refresh on every start and can't be deleted from the UI):
+
+- **NVIDIA NIM** — seeded from `NVIDIA_API_KEY` / `AI_MODEL` / `AI_ENDPOINT`.
+- **Personal provider** — seeded from `AI_PROVIDER_BASE_URL` +
+  `AI_PROVIDER_API_KEY` (both required), with optional `AI_PROVIDER_NAME`
+  (default "Personal LLM"), `AI_PROVIDER_MODEL`, and `AI_PROVIDER_DEFAULT=1`
+  to make it the default for new sessions. Removing the two required vars
+  removes the provider on the next start. Point it at any OpenAI-compatible
+  endpoint (NVIDIA, OpenCode, …) and swap later by editing env vars — no code
+  changes needed.
+
+To point the assistant at another provider (e.g. OpenCode), add it in the AI
+UI tab with its base URL, API key and model name — no code changes needed
+there either.
 
 ## Security notes
 
