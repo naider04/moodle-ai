@@ -33,6 +33,60 @@ async function api(path, { method = 'GET', body } = {}) {
   return data;
 }
 
+/** Stream the AI answer (SSE) and call back as tokens/tools arrive. */
+async function streamAI(messages, handlers) {
+  const res = await fetch('/api/ai/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages }),
+  });
+  if (res.status === 401) {
+    showLogin();
+    throw new Error('Session expired, please sign in again.');
+  }
+  if (!res.ok) {
+    let data = {};
+    try { data = await res.json(); } catch { /* empty body */ }
+    throw new Error(data.error || `Request failed (HTTP ${res.status})`);
+  }
+  if (!res.body) throw new Error('Streaming is not supported by this browser');
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let reply = '';
+  const trace = [];
+
+  const dispatch = (evt) => {
+    switch (evt.type) {
+      case 'status': handlers.onStatus && handlers.onStatus(evt.status); break;
+      case 'content': reply += evt.content; handlers.onContent && handlers.onContent(evt.content); break;
+      case 'tool': trace.push(evt.trace); handlers.onTool && handlers.onTool(evt.trace); break;
+      case 'done': return { reply, trace };
+      case 'error': throw new Error(evt.error);
+    }
+    return null;
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const parts = buf.split('\n\n');
+    buf = parts.pop();
+    for (const part of parts) {
+      for (const line of part.split('\n')) {
+        if (!line.startsWith('data:')) continue;
+        let evt;
+        try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        const result = dispatch(evt);
+        if (result) return result;
+      }
+    }
+  }
+  return { reply, trace };
+}
+
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
@@ -473,21 +527,63 @@ function renderAI(content) {
     state.aiMessages.push({ role: 'user', content: text });
     renderMsg({ role: 'user', content: text });
 
-    const typing = document.createElement('div');
-    typing.className = 'typing';
-    typing.textContent = 'Assistant is thinking…';
-    history.appendChild(typing);
-    history.scrollTop = history.scrollHeight;
     state.aiBusy = true;
     $('#ai-send').disabled = true;
 
+    let bubble = null;
+    let bodyEl = null;
+    let started = false;
+
+    const ensureBubble = () => {
+      if (bubble) return bodyEl;
+      bubble = document.createElement('div');
+      bubble.className = 'ai-msg assistant';
+      bubble.innerHTML = '<div class="who">Assistant</div>';
+      bodyEl = document.createElement('div');
+      bodyEl.className = 'body';
+      bubble.appendChild(bodyEl);
+      history.appendChild(bubble);
+      history.scrollTop = history.scrollHeight;
+      return bodyEl;
+    };
+
+    const addToolChip = (t) => {
+      ensureBubble();
+      let tools = bubble.querySelector('.ai-tools');
+      if (!tools) {
+        tools = document.createElement('div');
+        tools.className = 'ai-tools';
+        bubble.appendChild(tools);
+      }
+      const chip = document.createElement('span');
+      chip.className = `ai-tool-chip ${t.ok ? '' : 'err'}`;
+      chip.title = JSON.stringify(t.params || {});
+      chip.textContent = `🔧 ${t.function}${t.ok ? ' ✓' : ` ✗ ${t.error || ''}`}`;
+      tools.appendChild(chip);
+      history.scrollTop = history.scrollHeight;
+    };
+
     try {
-      const res = await api('/api/ai/chat', { method: 'POST', body: { messages: state.aiMessages } });
-      typing.remove();
-      state.aiMessages.push({ role: 'assistant', content: res.reply || '' });
-      renderMsg({ role: 'assistant', content: res.reply || '', trace: res.trace });
+      const outcome = await streamAI(state.aiMessages, {
+        onStatus: (status) => {
+          if (status === 'thinking' && !started) {
+            const b = ensureBubble();
+            b.innerHTML = '<div class="typing">Thinking…</div>';
+          }
+        },
+        onContent: (chunk) => {
+          const b = ensureBubble();
+          if (!started) { b.innerHTML = ''; started = true; }
+          b.appendChild(document.createTextNode(chunk));
+          history.scrollTop = history.scrollHeight;
+        },
+        onTool: addToolChip,
+      });
+      if (bubble) bubble.remove();
+      state.aiMessages.push({ role: 'assistant', content: outcome.reply || '', trace: outcome.trace });
+      renderMsg({ role: 'assistant', content: outcome.reply || '', trace: outcome.trace });
     } catch (e) {
-      typing.remove();
+      if (bubble) bubble.remove();
       renderMsg({ role: 'assistant', content: `⚠️ ${e.message}` });
     } finally {
       state.aiBusy = false;

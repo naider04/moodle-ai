@@ -86,11 +86,11 @@ echo "$GRADES" | grep -q '"usergrades"' && ok "grade items returned" || bad "gra
 
 if [ -n "${NVIDIA_API_KEY:-}" ]; then
   step "ai: chat with moodle_ws tool"
-  AI=$(curl -s -b "$COOKIES" -X POST "$BASE/api/ai/chat" \
+  AI=$(curl -sN -b "$COOKIES" -X POST "$BASE/api/ai/chat" \
     -H "Content-Type: application/json" \
     --data-raw '{"messages":[{"role":"user","content":"How many courses am I enrolled in? Use the tool and answer with just the number."}]}')
-  echo "$AI" | grep -q '"reply"' && ok "AI replied" || bad "AI: $(echo "$AI" | head -c 300)"
-  echo "$AI" | grep -q '"function"' && ok "AI used the moodle_ws tool (trace present)" || echo "  note: no tool trace in reply"
+  echo "$AI" | grep -q '"type":"done"' && ok "AI streamed a reply (SSE done event)" || bad "AI: $(echo "$AI" | head -c 300)"
+  echo "$AI" | grep -q '"type":"tool"' && ok "AI used the moodle_ws tool (SSE tool event)" || echo "  note: no tool event in stream"
 else
   echo "  skipped AI test (NVIDIA_API_KEY not set)"
 fi

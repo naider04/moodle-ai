@@ -32,6 +32,8 @@ an allow-list of the ~250 functions the official app uses.
 - **AI Assistant** — a chat agent (NVIDIA NIM, `stepfun-ai/step-3.7-flash`) that can
   call any allow-listed Moodle web service on your behalf through the `moodle_ws`
   tool, run a full tool-call loop, and answer questions about your account.
+  Answers are **streamed** to the browser as they are generated (with a
+  "Thinking…" indicator while the model reasons, tool traces shown live).
 
 ## Run locally
 
@@ -66,7 +68,7 @@ password. Credentials go straight to your Moodle server; nothing is stored.
 | `POST /api/logout` | Destroy session |
 | `POST /api/ws` | `{ wsfunction, params }` → Moodle REST (allow-listed) |
 | `GET /api/proxy?u=` | Fetch Moodle-hosted files with the token attached |
-| `POST /api/ai/chat` | `{ messages }` → AI assistant with `moodle_ws` tool |
+| `POST /api/ai/chat` | `{ messages }` → SSE stream from the AI assistant (`status`/`content`/`tool`/`done`/`error` events) |
 | `GET /api/health` | Health check |
 
 ## Security notes

@@ -11,7 +11,7 @@
  *   POST /api/logout
  *   POST /api/ws           { wsfunction, params } -> webservice/rest/server.php
  *   GET  /api/proxy?u=URL  proxy moodle-hosted files (adds the auth token)
- *   POST /api/ai/chat      { messages } -> NVIDIA chat completions with tools
+ *   POST /api/ai/chat      { messages } -> SSE stream from NVIDIA chat completions (with tools)
  *   GET  /api/config       non-secret bootstrap config for the login form
  *   GET  /api/health
  */
@@ -297,8 +297,86 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
   const history = [{ role: 'system', content: system }, ...incoming];
   const trace = [];
 
+  // Stream the answer to the browser as Server-Sent Events:
+  //   data: {"type":"status","status":"thinking"}   model is reasoning
+  //   data: {"type":"content","content":"..."}      visible answer tokens
+  //   data: {"type":"tool","trace":{...}}            a Moodle tool ran
+  //   data: {"type":"done","reply":"...","trace":[...]}
+  //   data: {"type":"error","error":"..."}
+  res.set({
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.flushHeaders();
+
+  // A client navigating away mid-answer closes the connection; writes after
+  // that throw EPIPE-style errors that would otherwise crash the process.
+  res.on('error', () => {});
+  const sendEvent = (payload) => {
+    if (res.writableEnded) return;
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  };
+
+  // Abort the upstream fetch if the browser disconnects.
+  const upstream = { controller: null };
+  req.on('close', () => upstream.controller && upstream.controller.abort());
+
+  /** Execute tool calls, stream their traces, and push results into history. */
+  async function runTools(calls) {
+    for (const call of calls) {
+      let args = {};
+      try {
+        args = JSON.parse(call.function.arguments || '{}');
+      } catch {
+        args = {};
+      }
+      const fn = args.function;
+      const toolParams = args.params || {};
+      if (USERID_DEFAULT_FUNCTIONS.has(fn) && (toolParams.userid === undefined || toolParams.userid === 0)) {
+        toolParams.userid = req.session.user.id;
+      }
+      if (!ALLOWED_FUNCTIONS.includes(fn)) {
+        const t = { function: fn, ok: false, error: 'Function not allowed' };
+        trace.push(t);
+        sendEvent({ type: 'tool', trace: t });
+        history.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: JSON.stringify({ error: `Function ${fn} is not available` }),
+        });
+        continue;
+      }
+      try {
+        const result = await moodleCall(req.session.siteUrl, req.session.token, fn, toolParams);
+        const t = { function: fn, params: toolParams, ok: true };
+        trace.push(t);
+        sendEvent({ type: 'tool', trace: t });
+        const payload = JSON.stringify(result);
+        history.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: payload.length > 60000 ? payload.slice(0, 60000) : payload,
+        });
+      } catch (e) {
+        const t = { function: fn, params: toolParams, ok: false, error: e.message };
+        trace.push(t);
+        sendEvent({ type: 'tool', trace: t });
+        history.push({
+          role: 'tool',
+          tool_call_id: call.id,
+          content: JSON.stringify({ error: e.message }),
+        });
+      }
+    }
+  }
+
   try {
     for (let turn = 0; turn < AI_MAX_TURNS; turn++) {
+      const controller = new AbortController();
+      upstream.controller = controller;
+
       const response = await fetch(AI_ENDPOINT, {
         method: 'POST',
         headers: {
@@ -311,70 +389,95 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
           tools: [MOODLE_TOOL],
           temperature: 0.3,
           max_tokens: 4000,
-          stream: false,
+          stream: true,
         }),
+        signal: controller.signal,
       });
 
-      if (!response.ok) {
+      if (!response.ok || !response.body) {
         const text = await response.text();
         throw new Error(`AI API error ${response.status}: ${text.slice(0, 500)}`);
       }
 
-      const data = await response.json();
-      const msg = data.choices?.[0]?.message;
-      if (!msg) throw new Error('AI API returned an empty response');
+      // Consume the upstream SSE, accumulating content and tool-call fragments.
+      let content = '';
+      let reasoningSeen = false;
+      let finishReason = null;
+      const toolSlots = [];
 
-      history.push(sanitizeAssistantMessage(msg));
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
 
-      const calls = msg.tool_calls || [];
-      if (!calls.length) {
-        return res.json({ reply: msg.content || '', trace });
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const data = trimmed.slice(5).trim();
+          if (data === '[DONE]') continue;
+          let chunk;
+          try { chunk = JSON.parse(data); } catch { continue; }
+          const choice = chunk.choices && chunk.choices[0];
+          if (!choice) continue;
+          if (choice.finish_reason) finishReason = choice.finish_reason;
+          const delta = choice.delta || {};
+          if ((delta.reasoning || delta.reasoning_content) && !reasoningSeen) {
+            reasoningSeen = true;
+            sendEvent({ type: 'status', status: 'thinking' });
+          }
+          if (delta.content) {
+            content += delta.content;
+            sendEvent({ type: 'content', content: delta.content });
+          }
+          if (delta.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const slot = toolSlots[tc.index || 0] || (toolSlots[tc.index || 0] = { id: '', name: '', arguments: '' });
+              if (tc.id) slot.id = tc.id;
+              if (tc.function) {
+                if (tc.function.name) slot.name += tc.function.name;
+                if (tc.function.arguments) slot.arguments += tc.function.arguments;
+              }
+            }
+          }
+        }
       }
 
-      for (const call of calls) {
-        let args = {};
-        try {
-          args = JSON.parse(call.function.arguments || '{}');
-        } catch {
-          args = {};
-        }
-        const fn = args.function;
-        const toolParams = args.params || {};
-        if (USERID_DEFAULT_FUNCTIONS.has(fn) && (toolParams.userid === undefined || toolParams.userid === 0)) {
-          toolParams.userid = req.session.user.id;
-        }
-        if (!ALLOWED_FUNCTIONS.includes(fn)) {
-          trace.push({ function: fn, ok: false, error: 'Function not allowed' });
-          history.push({
-            role: 'tool',
-            tool_call_id: call.id,
-            content: JSON.stringify({ error: `Function ${fn} is not available` }),
-          });
-          continue;
-        }
-        try {
-          const result = await moodleCall(req.session.siteUrl, req.session.token, fn, toolParams);
-          trace.push({ function: fn, params: toolParams, ok: true });
-          const payload = JSON.stringify(result);
-          history.push({
-            role: 'tool',
-            tool_call_id: call.id,
-            content: payload.length > 60000 ? payload.slice(0, 60000) : payload,
-          });
-        } catch (e) {
-          trace.push({ function: fn, params: toolParams, ok: false, error: e.message });
-          history.push({
-            role: 'tool',
-            tool_call_id: call.id,
-            content: JSON.stringify({ error: e.message }),
-          });
-        }
+      // Replay this assistant turn into history (sanitized) for the next call.
+      const calls = toolSlots
+        .filter((s) => s.name || s.arguments)
+        .map((s, i) => ({
+          id: s.id || `call_${turn}_${i}`,
+          type: 'function',
+          function: { name: s.name, arguments: s.arguments || '{}' },
+        }));
+      history.push(sanitizeAssistantMessage({ role: 'assistant', content: content || null, tool_calls: calls }));
+
+      if (calls.length) {
+        await runTools(calls);
+        continue; // loop for the model's next turn
       }
+
+      if (finishReason === 'length' && content) {
+        history.push({ role: 'user', content: 'Please continue.' });
+        continue;
+      }
+
+      sendEvent({ type: 'done', reply: content || '', trace });
+      return res.end();
     }
 
-    res.json({ reply: 'I could not finish answering in time. Please try a simpler question.', trace });
+    sendEvent({ type: 'done', reply: 'I could not finish answering in time. Please try a simpler question.', trace });
+    res.end();
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    if (!res.writableEnded) {
+      sendEvent({ type: 'error', error: e.message });
+      res.end();
+    }
   }
 });
 
