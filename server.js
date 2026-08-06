@@ -11,7 +11,12 @@
  *   POST /api/logout
  *   POST /api/ws           { wsfunction, params } -> webservice/rest/server.php
  *   GET  /api/proxy?u=URL  proxy moodle-hosted files (adds the auth token)
- *   POST /api/ai/chat      { messages } -> SSE stream from NVIDIA chat completions (with tools)
+ *   POST /api/ai/chat      { messages } -> SSE stream from the active AI provider (with tools)
+ *   GET  /api/ai/providers            list configured AI providers
+ *   POST /api/ai/providers            add an OpenAI-compatible provider
+ *   PUT /api/ai/providers/:id         edit a provider
+ *   DELETE /api/ai/providers/:id      remove a provider
+ *   POST /api/ai/active               { id } pick the active provider
  *   GET  /api/config       non-secret bootstrap config for the login form
  *   GET  /api/health
  */
@@ -20,6 +25,7 @@
 require('dotenv').config();
 
 const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const session = require('express-session');
 
@@ -175,7 +181,7 @@ app.get('/api/config', (req, res) => {
   res.json({
     defaultSite: process.env.DEFAULT_SITE || '',
     defaultUsername: process.env.DEFAULT_USERNAME || '',
-    aiConfigured: Boolean(process.env.NVIDIA_API_KEY),
+    aiConfigured: providers.length > 0,
   });
 });
 
@@ -239,9 +245,74 @@ app.get('/api/proxy', requireAuth, async (req, res) => {
  * AI assistant (NVIDIA API) with a Moodle tool
  * ------------------------------------------------------------------ */
 
-const AI_ENDPOINT = 'https://integrate.api.nvidia.com/v1/chat/completions';
-const AI_MODEL = process.env.AI_MODEL || 'stepfun-ai/step-3.7-flash';
 const AI_MAX_TURNS = parseInt(process.env.AI_MAX_TURNS || '8', 10);
+
+/* ------------------------------------------------------------------ *
+ * AI providers — OpenAI-compatible endpoints, persisted in providers.json.
+ * The built-in NVIDIA provider is seeded from env vars so the app works
+ * out of the box; you can add any other endpoint (e.g. OpenCode) in the UI.
+ * ------------------------------------------------------------------ */
+
+const PROVIDERS_FILE = path.join(__dirname, 'providers.json');
+
+function loadProviders() {
+  try {
+    const data = JSON.parse(fs.readFileSync(PROVIDERS_FILE, 'utf8'));
+    if (Array.isArray(data.providers)) return data.providers;
+  } catch { /* no file yet */ }
+  return [];
+}
+
+function saveProviders(list) {
+  try {
+    fs.writeFileSync(PROVIDERS_FILE, JSON.stringify({ providers: list }, null, 2));
+  } catch (e) {
+    console.error('Could not persist providers:', e.message);
+  }
+}
+
+function maskKey(key) {
+  if (!key) return '';
+  if (key.length <= 8) return '••••';
+  return `${key.slice(0, 3)}…${key.slice(-4)}`;
+}
+
+/** Strip the API key before sending providers to the browser. */
+function publicProvider(p) {
+  return {
+    id: p.id,
+    name: p.name,
+    baseUrl: p.baseUrl,
+    model: p.model || '',
+    apiKeyMasked: maskKey(p.apiKey),
+    builtin: !!p.builtin,
+    default: !!p.default,
+  };
+}
+
+let providers = loadProviders();
+
+// Seed / refresh the built-in NVIDIA provider from environment variables.
+if (process.env.NVIDIA_API_KEY) {
+  const existing = providers.find((p) => p.builtin);
+  if (existing) {
+    existing.apiKey = process.env.NVIDIA_API_KEY;
+    if (process.env.AI_MODEL) existing.model = process.env.AI_MODEL;
+  } else {
+    providers.unshift({
+      id: 'builtin-nvidia',
+      name: 'NVIDIA NIM',
+      baseUrl: (process.env.AI_ENDPOINT || 'https://integrate.api.nvidia.com/v1/chat/completions')
+        .replace(/\/chat\/completions$/, ''),
+      apiKey: process.env.NVIDIA_API_KEY,
+      model: process.env.AI_MODEL || 'stepfun-ai/step-3.7-flash',
+      builtin: true,
+      default: true,
+      createdAt: Date.now(),
+    });
+    saveProviders(providers);
+  }
+}
 
 const MOODLE_TOOL = {
   type: 'function',
@@ -275,10 +346,75 @@ function sanitizeAssistantMessage(msg) {
   return clean;
 }
 
-app.post('/api/ai/chat', requireAuth, async (req, res) => {
-  if (!process.env.NVIDIA_API_KEY) {
-    return res.status(503).json({ error: 'AI is not configured (missing NVIDIA_API_KEY env var).' });
+app.get('/api/ai/providers', requireAuth, (req, res) => {
+  res.json({ providers: providers.map(publicProvider), activeId: req.session.activeProviderId || null });
+});
+
+app.post('/api/ai/providers', requireAuth, (req, res) => {
+  const name = String(req.body.name || '').trim();
+  const baseUrl = String(req.body.baseUrl || '').trim().replace(/\/+$/, '');
+  const apiKey = String(req.body.apiKey || '').trim();
+  const model = String(req.body.model || '').trim();
+  if (!name) return res.status(400).json({ error: 'Provider name is required' });
+  if (!/^https?:\/\//i.test(baseUrl)) return res.status(400).json({ error: 'Base URL must start with http(s)://' });
+  if (!apiKey) return res.status(400).json({ error: 'API key is required' });
+  providers.push({
+    id: `p_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+    name,
+    baseUrl,
+    apiKey,
+    model,
+    builtin: false,
+    createdAt: Date.now(),
+  });
+  saveProviders(providers);
+  res.json({ ok: true, providers: providers.map(publicProvider), activeId: req.session.activeProviderId || null });
+});
+
+app.put('/api/ai/providers/:id', requireAuth, (req, res) => {
+  const p = providers.find((x) => x.id === req.params.id);
+  if (!p) return res.status(404).json({ error: 'Provider not found' });
+  const { name, baseUrl, apiKey, model } = req.body;
+  if (name !== undefined) p.name = String(name).trim() || p.name;
+  if (baseUrl !== undefined) {
+    const b = String(baseUrl).trim().replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(b)) return res.status(400).json({ error: 'Base URL must start with http(s)://' });
+    p.baseUrl = b;
   }
+  if (apiKey !== undefined && String(apiKey).trim()) p.apiKey = String(apiKey).trim();
+  if (model !== undefined) p.model = String(model).trim();
+  saveProviders(providers);
+  res.json({ ok: true, providers: providers.map(publicProvider), activeId: req.session.activeProviderId || null });
+});
+
+app.delete('/api/ai/providers/:id', requireAuth, (req, res) => {
+  const idx = providers.findIndex((x) => x.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: 'Provider not found' });
+  if (providers[idx].builtin) return res.status(400).json({ error: 'The built-in provider cannot be deleted' });
+  providers.splice(idx, 1);
+  if (req.session.activeProviderId === req.params.id) req.session.activeProviderId = undefined;
+  saveProviders(providers);
+  res.json({ ok: true, providers: providers.map(publicProvider), activeId: req.session.activeProviderId || null });
+});
+
+app.post('/api/ai/active', requireAuth, (req, res) => {
+  const id = String(req.body.id || '');
+  if (!providers.some((p) => p.id === id)) return res.status(404).json({ error: 'Provider not found' });
+  req.session.activeProviderId = id;
+  res.json({ ok: true, activeId: id });
+});
+
+app.post('/api/ai/chat', requireAuth, async (req, res) => {
+  const activeProvider =
+    providers.find((p) => p.id === req.session.activeProviderId) ||
+    providers.find((p) => p.default) ||
+    providers[0];
+  if (!activeProvider) {
+    return res.status(503).json({ error: 'No AI provider configured. Add one in the AI tab or set NVIDIA_API_KEY on the server.' });
+  }
+  const aiEndpoint = `${activeProvider.baseUrl.replace(/\/+$/, '')}/chat/completions`;
+  const aiKey = activeProvider.apiKey;
+  const aiModel = activeProvider.model || '';
 
   const incoming = Array.isArray(req.body.messages) ? req.body.messages : [];
   if (!incoming.length) return res.status(400).json({ error: 'messages is required' });
@@ -377,14 +513,14 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
       const controller = new AbortController();
       upstream.controller = controller;
 
-      const response = await fetch(AI_ENDPOINT, {
+      const response = await fetch(aiEndpoint, {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${process.env.NVIDIA_API_KEY}`,
+          Authorization: `Bearer ${aiKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: AI_MODEL,
+          ...(aiModel ? { model: aiModel } : {}),
           messages: history,
           tools: [MOODLE_TOOL],
           temperature: 0.3,

@@ -59,6 +59,20 @@ step "me"
 ME=$(curl -s -b "$COOKIES" "$BASE/api/me")
 echo "$ME" | grep -q '"username"' && ok "session user returned" || bad "me: $ME"
 
+step "ai: providers"
+PROVS=$(curl -s -b "$COOKIES" "$BASE/api/ai/providers")
+echo "$PROVS" | grep -q '"providers"' && ok "provider list returned" || bad "providers: $PROVS"
+if [ -n "${NVIDIA_API_KEY:-}" ]; then
+  echo "$PROVS" | grep -qi '"name":"NVIDIA' && ok "built-in NVIDIA provider seeded" || echo "  note: no NVIDIA provider found"
+fi
+NEWID=$(curl -s -b "$COOKIES" -X POST "$BASE/api/ai/providers" \
+  -H "Content-Type: application/json" \
+  --data-raw '{"name":"test-prov","baseUrl":"https://example.com/v1","apiKey":"sk-test-12345","model":"test-model"}' \
+  | grep -o '"id":"[^"]*"' | tail -1 | cut -d'"' -f4)
+[ -n "$NEWID" ] && ok "added custom provider (id $NEWID)" || bad "add provider: $NEWID"
+DEL=$(curl -s -b "$COOKIES" -X DELETE "$BASE/api/ai/providers/$NEWID")
+echo "$DEL" | grep -q '"ok":true' && ok "deleted custom provider" || bad "delete: $DEL"
+
 step "ws: core_enrol_get_users_courses"
 COURSES=$(curl -s -b "$COOKIES" -X POST "$BASE/api/ws" \
   -H "Content-Type: application/json" \

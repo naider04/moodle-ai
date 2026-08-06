@@ -13,6 +13,8 @@ const state = {
   aiMessages: [],
   conversation: null,
   aiBusy: false,
+  providers: [],
+  activeProviderId: null,
 };
 
 const $ = (sel) => document.querySelector(sel);
@@ -483,19 +485,41 @@ const AI_SUGGESTIONS = [
 ];
 
 function renderAI(content) {
-  const aiConfigured = window.aiConfigured;
   content.innerHTML = `
     <div class="ai-layout">
       <div class="ai-chat">
+        <div class="ai-provider-bar">
+          <label for="ai-provider">Provider</label>
+          <select id="ai-provider" title="Active AI provider">
+            <option value="">No providers configured</option>
+          </select>
+          <button class="btn ghost small" id="ai-provider-add" title="Add a provider">＋ Add</button>
+          <button class="btn ghost small" id="ai-provider-edit" title="Edit provider">✎</button>
+          <button class="btn ghost small" id="ai-provider-del" title="Delete provider">🗑</button>
+        </div>
         <div class="ai-history" id="ai-history"></div>
-        ${aiConfigured === false ? '<div class="error-box" style="margin:0 12px 12px;">AI is not configured on the server (missing <code>NVIDIA_API_KEY</code>). Add it via Render env vars or your local <code>.env</code>.</div>' : ''}
+        <div class="error-box hidden" id="ai-no-provider" style="margin:0 12px 12px;">No AI provider configured. Click <b>＋ Add</b> above to add any OpenAI-compatible endpoint (e.g. NVIDIA NIM, OpenCode), or set <code>NVIDIA_API_KEY</code> on the server.</div>
         <div class="ai-suggestions">${AI_SUGGESTIONS.map((s) => `<span class="ai-suggestion">${esc(s)}</span>`).join('')}</div>
         <div class="ai-input-bar">
           <textarea id="ai-input" rows="2" placeholder="Ask anything about your Moodle account…"></textarea>
           <button class="btn" id="ai-send">Send</button>
         </div>
       </div>
-    </div>`;
+    </div>
+    <dialog class="provider-dialog" id="provider-dialog">
+      <form id="provider-form" novalidate>
+        <h3 id="provider-dialog-title">Add AI provider</h3>
+        <label><span>Name</span><input type="text" id="prov-name" placeholder="e.g. OpenCode" /></label>
+        <label><span>Base URL</span><input type="text" id="prov-url" placeholder="https://api.example.com/v1" /></label>
+        <label><span>API key</span><input type="password" id="prov-key" placeholder="sk-..." /></label>
+        <label><span>Model (optional)</span><input type="text" id="prov-model" placeholder="e.g. big-pickle, gpt-4o-mini" /></label>
+        <div class="provider-dialog-actions">
+          <button type="button" class="btn ghost" id="prov-cancel">Cancel</button>
+          <button type="submit" class="btn" id="prov-save">Save</button>
+        </div>
+        <p class="login-error" id="prov-error"></p>
+      </form>
+    </dialog>`;
 
   const history = $('#ai-history');
   const renderMsg = (m) => {
@@ -518,6 +542,112 @@ function renderAI(content) {
   };
 
   state.aiMessages.forEach(renderMsg);
+
+  /* ---------- AI provider management ---------- */
+
+  const providerSelect = $('#ai-provider');
+  const noProvBox = $('#ai-no-provider');
+  let providerDialogId = null;
+
+  const renderProviders = (providers) => {
+    providerSelect.innerHTML = '';
+    if (!providers.length) {
+      providerSelect.innerHTML = '<option value="">No providers configured</option>';
+      return;
+    }
+    providers.forEach((p) => {
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = `${p.name} — ${p.model || 'default model'}${p.builtin ? ' (built-in)' : ''}`;
+      providerSelect.appendChild(opt);
+    });
+  };
+
+  const refreshProviders = async () => {
+    const data = await api('/api/ai/providers');
+    state.providers = data.providers || [];
+    state.activeProviderId = data.activeId || null;
+    renderProviders(state.providers);
+    const any = state.providers.length > 0;
+    noProvBox.classList.toggle('hidden', any);
+    $('#ai-send').disabled = !any || state.aiBusy;
+    if (any) {
+      if (!state.providers.some((p) => p.id === state.activeProviderId)) {
+        const fallback = state.providers.find((p) => p.default) || state.providers[0];
+        state.activeProviderId = fallback.id;
+        await api('/api/ai/active', { method: 'POST', body: { id: fallback.id } });
+      }
+      providerSelect.value = state.activeProviderId;
+    }
+  };
+
+  const openDialog = (provider) => {
+    providerDialogId = provider ? provider.id : null;
+    $('#provider-dialog-title').textContent = provider ? 'Edit AI provider' : 'Add AI provider';
+    $('#prov-name').value = provider ? provider.name : '';
+    $('#prov-url').value = provider ? provider.baseUrl : '';
+    $('#prov-key').value = '';
+    $('#prov-key').placeholder = provider ? 'Leave blank to keep the current key' : 'sk-...';
+    $('#prov-key').required = !provider;
+    $('#prov-model').value = provider ? (provider.model || '') : '';
+    $('#prov-error').textContent = '';
+    $('#provider-dialog').showModal();
+  };
+
+  $('#ai-provider-add').addEventListener('click', () => openDialog(null));
+  $('#ai-provider-edit').addEventListener('click', () => {
+    const p = state.providers.find((x) => x.id === providerSelect.value);
+    if (p) openDialog(p);
+  });
+  $('#ai-provider-del').addEventListener('click', async () => {
+    const p = state.providers.find((x) => x.id === providerSelect.value);
+    if (!p) return;
+    if (p.builtin) { alert('The built-in provider cannot be deleted.'); return; }
+    if (!confirm(`Delete provider "${p.name}"?`)) return;
+    try {
+      const data = await api(`/api/ai/providers/${p.id}`, { method: 'DELETE' });
+      state.providers = data.providers || [];
+      state.activeProviderId = data.activeId || null;
+      renderProviders(state.providers);
+      noProvBox.classList.toggle('hidden', state.providers.length > 0);
+      if (state.providers.length) providerSelect.value = state.activeProviderId || state.providers[0].id;
+      $('#ai-send').disabled = !state.providers.length || state.aiBusy;
+    } catch (e) { alert(e.message); }
+  });
+  $('#prov-cancel').addEventListener('click', () => $('#provider-dialog').close());
+  $('#provider-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = $('#prov-name').value.trim();
+    const baseUrl = $('#prov-url').value.trim();
+    const key = $('#prov-key').value.trim();
+    const model = $('#prov-model').value.trim();
+    const errEl = $('#prov-error');
+    errEl.textContent = '';
+    if (!name) { errEl.textContent = 'Name is required.'; return; }
+    if (!/^https?:\/\//i.test(baseUrl)) { errEl.textContent = 'Base URL must start with http(s)://'; return; }
+    if (!providerDialogId && !key) { errEl.textContent = 'API key is required for a new provider.'; return; }
+    try {
+      const body = { name, baseUrl, model };
+      if (key) body.apiKey = key;
+      await api(providerDialogId ? `/api/ai/providers/${providerDialogId}` : '/api/ai/providers',
+        { method: providerDialogId ? 'PUT' : 'POST', body });
+      $('#provider-dialog').close();
+      await refreshProviders();
+    } catch (err) { errEl.textContent = err.message; }
+  });
+  providerSelect.addEventListener('change', async () => {
+    const id = providerSelect.value;
+    if (!id) return;
+    try {
+      await api('/api/ai/active', { method: 'POST', body: { id } });
+      state.activeProviderId = id;
+    } catch (e) { alert(e.message); }
+  });
+
+  refreshProviders().catch((e) => {
+    noProvBox.classList.remove('hidden');
+    noProvBox.textContent = `Could not load AI providers: ${e.message}`;
+  });
 
   const send = async () => {
     const input = $('#ai-input');
@@ -587,7 +717,7 @@ function renderAI(content) {
       renderMsg({ role: 'assistant', content: `⚠️ ${e.message}` });
     } finally {
       state.aiBusy = false;
-      $('#ai-send').disabled = false;
+      $('#ai-send').disabled = !state.providers.length;
       $('#ai-input').focus();
     }
   };

@@ -29,11 +29,14 @@ an allow-list of the ~250 functions the official app uses.
 - **Calendar** — upcoming action events from `core_calendar_get_action_events_by_timesort`
 - **Messages** — conversations, unread counts, and replying
   (`core_message_*`)
-- **AI Assistant** — a chat agent (NVIDIA NIM, `stepfun-ai/step-3.7-flash`) that can
-  call any allow-listed Moodle web service on your behalf through the `moodle_ws`
-  tool, run a full tool-call loop, and answer questions about your account.
-  Answers are **streamed** to the browser as they are generated (with a
-  "Thinking…" indicator while the model reasons, tool traces shown live).
+- **AI Assistant** — a chat agent that can call any allow-listed Moodle web
+  service on your behalf through the `moodle_ws` tool, run a full tool-call
+  loop, and answer questions about your account. Answers are **streamed** to
+  the browser as they are generated (with a "Thinking…" indicator while the
+  model reasons, tool traces shown live).
+- **Bring your own LLM** — configure any OpenAI-compatible provider (NVIDIA
+  NIM, OpenCode, etc.) by name, base URL, API key and model, then switch
+  between them from the AI tab. Built-in NVIDIA provider is seeded from env.
 
 ## Run locally
 
@@ -68,8 +71,22 @@ password. Credentials go straight to your Moodle server; nothing is stored.
 | `POST /api/logout` | Destroy session |
 | `POST /api/ws` | `{ wsfunction, params }` → Moodle REST (allow-listed) |
 | `GET /api/proxy?u=` | Fetch Moodle-hosted files with the token attached |
-| `POST /api/ai/chat` | `{ messages }` → SSE stream from the AI assistant (`status`/`content`/`tool`/`done`/`error` events) |
+| `POST /api/ai/chat` | `{ messages }` → SSE stream from the active AI provider (`status`/`content`/`tool`/`done`/`error` events) |
+| `GET /api/ai/providers` | List configured AI providers (API keys masked) + active id |
+| `POST /api/ai/providers` | `{ name, baseUrl, apiKey, model? }` → add an OpenAI-compatible provider |
+| `PUT /api/ai/providers/:id` | Edit a provider (leave `apiKey` empty to keep the current key) |
+| `DELETE /api/ai/providers/:id` | Remove a provider (built-in is protected) |
+| `POST /api/ai/active` | `{ id }` → set the active provider for this session |
 | `GET /api/health` | Health check |
+
+### AI providers
+
+Providers are OpenAI-compatible endpoints stored in `providers.json` (gitignored,
+keys stay server-side; on Render the file lives on the instance's ephemeral disk,
+so re-add providers after a redeploy). A built-in NVIDIA provider is seeded from
+`NVIDIA_API_KEY` / `AI_MODEL` / `AI_ENDPOINT` env vars. To point the assistant at
+another provider (e.g. OpenCode), add it in the AI tab with its base URL, API
+key and model name — no code changes needed.
 
 ## Security notes
 

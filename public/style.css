@@ -343,6 +343,19 @@ input:focus, select:focus, textarea:focus {
 .ai-suggestion:hover { background: #fbe3c9; }
 .typing { color: var(--text-dim); font-style: italic; }
 
+/* AI provider bar + add/edit dialog */
+.ai-provider-bar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.ai-provider-bar label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); }
+.ai-provider-bar select { width: auto; flex: 1; min-width: 200px; padding: 7px 10px; }
+.provider-dialog { border: none; border-radius: 14px; padding: 0; background: var(--panel); box-shadow: 0 20px 50px rgba(0, 0, 0, 0.35); width: min(440px, 92vw); }
+.provider-dialog::backdrop { background: rgba(10, 15, 30, 0.55); }
+.provider-dialog form { padding: 22px 24px; display: flex; flex-direction: column; gap: 12px; }
+.provider-dialog h3 { margin: 0 0 4px; }
+.provider-dialog label span { display: block; font-size: 12px; font-weight: 600; margin-bottom: 5px; color: var(--text-dim); }
+.provider-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.provider-dialog-actions .btn { width: auto; padding: 8px 16px; }
+.provider-dialog .login-error { margin-top: 0; }
+
 /* ---------- Misc ---------- */
 .back-link { display: inline-block; margin-bottom: 14px; color: var(--accent-dark); text-decoration: none; font-weight: 600; cursor: pointer; }
 .back-link:hover { text-decoration: underline; }
