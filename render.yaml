@@ -16,10 +16,6 @@ services:
         generateValue: true
       - key: DEFAULT_SITE
         value: https://aulagradoa.unemi.edu.ec
-      # Optional: pre-fill the username on the login form
-      - key: DEFAULT_USERNAME
-        value: wpatinoc
-        sync: false
       # Your NVIDIA NIM API key for the AI assistant — set it in the Render dashboard
       - key: NVIDIA_API_KEY
         sync: false
