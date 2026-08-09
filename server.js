@@ -606,7 +606,6 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
     `File links returned by the Moodle web service (fileurl, webservice/pluginfile.php) open and download directly in this viewer — always give those exact URLs when listing files, and do not suggest workarounds for opening them.`,
     `Data you already retrieved in this conversation is still in context — do not re-fetch it with another tool call unless it may have changed (e.g. after an action you performed).`,
     `To link to an activity use ${req.session.siteUrl}/mod/{modname}/view.php?id={coursemodule} (e.g. mod/quiz/view.php for quizzes). The coursemodule id comes from the mod_* functions (e.g. mod_quiz_get_quizzes_by_courses); core_enrol_get_users_courses returns no module ids.`,
-    `Useful functions include: core_enrol_get_users_courses, core_course_get_contents, core_webservice_get_site_info, gradereport_user_get_grade_items, gradereport_overview_get_course_grades, core_calendar_get_action_events_by_timesort, core_message_get_conversations, core_message_get_conversation_messages, core_message_mark_all_conversation_messages_as_read, core_completion_get_activities_completion_status, mod_assign_get_assignments, mod_assign_get_submission_status, mod_forum_get_forums_by_courses, mod_forum_get_forum_discussions, mod_forum_add_discussion_post, mod_quiz_get_quizzes_by_courses, mod_quiz_get_user_attempts, core_files_get_files, core_user_get_course_user_profiles.`,
   ].join('\n');
 
   const history = [{ role: 'system', content: system }, ...incoming];
