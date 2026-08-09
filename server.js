@@ -334,8 +334,11 @@ app.get('/api/proxy', requireAuth, async (req, res) => {
 
 const AI_MAX_TURNS = parseInt(process.env.AI_MAX_TURNS || '8', 10);
 const AI_TIMEOUT_MS = parseInt(process.env.AI_TIMEOUT_MS || '90000', 10); // per LLM call: connect + stream
-const AI_STALL_MS = parseInt(process.env.AI_STALL_MS || '6000', 10); // abort if the provider sends no SSE bytes for this long
+const AI_STALL_MS = parseInt(process.env.AI_STALL_MS || '30000', 10); // abort if the provider sends no SSE bytes for this long (real dead connection)
+const AI_STALL_WARN_MS = parseInt(process.env.AI_STALL_WARN_MS || '6000', 10); // warn the UI after this much silence — slow thinking ≠ stuck
+const AI_RETRIES = parseInt(process.env.AI_RETRIES || '2', 10); // re-attempt stalled/timeout provider calls before giving up
 const MOODLE_TIMEOUT_MS = parseInt(process.env.MOODLE_TIMEOUT_MS || '30000', 10); // per Moodle web service call
+const AI_CONTEXT_BUDGET = parseInt(process.env.AI_CONTEXT_BUDGET || '120000', 10); // cap total chars of conversation content sent to the provider per turn
 
 /* ------------------------------------------------------------------ *
  * AI providers — OpenAI-compatible endpoints, persisted in providers.json.
@@ -610,8 +613,12 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
   const trace = [];
 
   // Stream the answer to the browser as Server-Sent Events:
-  //   data: {"type":"status","status":"thinking"}   model is reasoning
-  //   data: {"type":"status","status":"error",      terminal failure; code identifies the cause
+  //   data: {"type":"status","status":"thinking"}        model is reasoning
+  //   data: {"type":"status","status":"still_waiting"}  no bytes for AI_STALL_WARN_MS (slow, not stuck)
+  //   data: {"type":"status","status":"retrying",     provider stalled/timed out; re-attempting
+  //          "attempt":N,"max":M}
+  //   data: {"type":"rollback","chars":N}            drop the last N content chars (stalled turn retried)
+  //   data: {"type":"status","status":"error",          terminal failure; code identifies the cause
   //          "code":"...","message":"..."}
   //   data: {"type":"content","content":"..."}      visible answer tokens
   //   data: {"type":"tool","trace":{...}}            a Moodle tool ran
@@ -776,133 +783,193 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
     }
   }
 
-  try {
-    for (let turn = 0; turn < AI_MAX_TURNS; turn++) {
-      if (disconnected) break;
-      const controller = new AbortController();
-      upstream.controller = controller;
+  /**
+   * Keep the conversation context bounded so the provider's time-to-first-token
+   * stays low: once the raw content exceeds AI_CONTEXT_BUDGET, blank the oldest
+   * tool results (the model can re-fetch anything it still needs).
+   */
+  function compactHistory() {
+    let total = history.reduce((s, m) => s + String(m.content || '').length, 0);
+    if (total <= AI_CONTEXT_BUDGET) return;
+    for (const m of history) {
+      if (total <= AI_CONTEXT_BUDGET) break;
+      if (m.role === 'tool' && m.content && !String(m.content).startsWith('[tool result omitted')) {
+        total -= String(m.content).length;
+        m.content = '[tool result omitted to keep the conversation fast — re-fetch with the moodle_ws tool if needed]';
+      }
+    }
+  }
 
-      // Watchdog: if the provider hasn't answered at all within the budget,
-      // abort and report it as a timeout instead of hanging forever.
-      const idleWatchdog = setTimeout(() => {
-        const err = new Error(`No response from the AI provider after ${Math.round(AI_TIMEOUT_MS / 1000)}s`);
-        err.code = 'timeout';
+  /**
+   * One streaming call to the AI provider. Returns { content, calls,
+   * finishReason } or throws a classified error (see the SSE comment above
+   * for the failure codes).
+   */
+  async function streamTurn() {
+    const controller = new AbortController();
+    upstream.controller = controller;
+
+    // Watchdog: if the provider hasn't answered at all within the budget,
+    // abort and report it as a timeout instead of hanging forever.
+    const idleWatchdog = setTimeout(() => {
+      const err = new Error(`No response from the AI provider after ${Math.round(AI_TIMEOUT_MS / 1000)}s`);
+      err.code = 'timeout';
+      controller.abort(err);
+    }, AI_TIMEOUT_MS);
+
+    let response;
+    try {
+      response = await fetch(aiEndpoint, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${aiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          ...(aiModel ? { model: aiModel } : {}),
+          messages: history,
+          tools: [MOODLE_TOOL],
+          temperature: 0.3,
+          max_tokens: 4000,
+          stream: true,
+        }),
+        signal: controller.signal,
+      });
+    } catch (e) {
+      clearTimeout(idleWatchdog);
+      throw e;
+    }
+
+    if (!response.ok || !response.body) {
+      clearTimeout(idleWatchdog);
+      const text = await response.text();
+      const err = new Error(`AI API error ${response.status}: ${text.slice(0, 500)}`);
+      err.code = response.status === 429
+        ? 'rate_limit'
+        : response.status === 401 || response.status === 403 ? 'auth'
+        : response.status >= 500 ? 'api_error'
+        : 'http_error';
+      err.status = response.status;
+      throw err;
+    }
+
+    // Consume the upstream SSE, accumulating content and tool-call fragments.
+    // Stall watchdog: if the provider stops sending bytes mid-stream, abort
+    // and report it so we never leave the user staring at "Thinking…" forever.
+    let lastChunkAt = Date.now();
+    let stallWarned = false;
+    const stallWatchdog = setInterval(() => {
+      const idle = Date.now() - lastChunkAt;
+      if (idle > AI_STALL_MS) {
+        // Truly dead: the provider went silent past the hard limit.
+        const err = new Error(`The AI provider sent no data for ${Math.round(AI_STALL_MS / 1000)}s`);
+        err.code = 'stalled';
         controller.abort(err);
-      }, AI_TIMEOUT_MS);
-
-      let response;
-      try {
-        response = await fetch(aiEndpoint, {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${aiKey}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            ...(aiModel ? { model: aiModel } : {}),
-            messages: history,
-            tools: [MOODLE_TOOL],
-            temperature: 0.3,
-            max_tokens: 4000,
-            stream: true,
-          }),
-          signal: controller.signal,
-        });
-      } catch (e) {
-        clearTimeout(idleWatchdog);
-        throw e;
+      } else if (idle > AI_STALL_WARN_MS && !stallWarned) {
+        // Slow prefill / reasoning, not a failure — tell the UI to wait.
+        stallWarned = true;
+        sendEvent({ type: 'status', status: 'still_waiting' });
       }
+    }, 2000);
 
-      if (!response.ok || !response.body) {
-        clearTimeout(idleWatchdog);
-        const text = await response.text();
-        const err = new Error(`AI API error ${response.status}: ${text.slice(0, 500)}`);
-        err.code = response.status === 429
-          ? 'rate_limit'
-          : response.status === 401 || response.status === 403 ? 'auth'
-          : response.status >= 500 ? 'api_error'
-          : 'http_error';
-        err.status = response.status;
-        throw err;
-      }
+    let content = '';
+    let reasoningSeen = false;
+    let finishReason = null;
+    const toolSlots = [];
 
-      // Consume the upstream SSE, accumulating content and tool-call fragments.
-      // Stall watchdog: if the provider stops sending bytes mid-stream, abort
-      // and report it so we never leave the user staring at "Thinking…" forever.
-      let lastChunkAt = Date.now();
-      const stallWatchdog = setInterval(() => {
-        if (Date.now() - lastChunkAt > AI_STALL_MS) {
-          const err = new Error(`The AI provider sent no data for ${Math.round(AI_STALL_MS / 1000)}s`);
-          err.code = 'stalled';
-          controller.abort(err);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+
+    try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      lastChunkAt = Date.now();
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const data = trimmed.slice(5).trim();
+        if (data === '[DONE]') continue;
+        let chunk;
+        try { chunk = JSON.parse(data); } catch { continue; }
+        const choice = chunk.choices && chunk.choices[0];
+        if (!choice) continue;
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+        const delta = choice.delta || {};
+        if ((delta.reasoning || delta.reasoning_content) && !reasoningSeen) {
+          reasoningSeen = true;
+          sendEvent({ type: 'status', status: 'thinking' });
         }
-      }, 2000);
-
-      let content = '';
-      let reasoningSeen = false;
-      let finishReason = null;
-      const toolSlots = [];
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buf = '';
-
-      try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        lastChunkAt = Date.now();
-        buf += decoder.decode(value, { stream: true });
-        const lines = buf.split('\n');
-        buf = lines.pop();
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith('data:')) continue;
-          const data = trimmed.slice(5).trim();
-          if (data === '[DONE]') continue;
-          let chunk;
-          try { chunk = JSON.parse(data); } catch { continue; }
-          const choice = chunk.choices && chunk.choices[0];
-          if (!choice) continue;
-          if (choice.finish_reason) finishReason = choice.finish_reason;
-          const delta = choice.delta || {};
-          if ((delta.reasoning || delta.reasoning_content) && !reasoningSeen) {
-            reasoningSeen = true;
-            sendEvent({ type: 'status', status: 'thinking' });
-          }
-          if (delta.content) {
-            content += delta.content;
-            sendEvent({ type: 'content', content: delta.content });
-          }
-          if (delta.tool_calls) {
-            for (const tc of delta.tool_calls) {
-              const slot = toolSlots[tc.index || 0] || (toolSlots[tc.index || 0] = { id: '', name: '', arguments: '' });
-              if (tc.id) slot.id = tc.id;
-              if (tc.function) {
-                if (tc.function.name) slot.name += tc.function.name;
-                if (tc.function.arguments) slot.arguments += tc.function.arguments;
-              }
+        if (delta.content) {
+          content += delta.content;
+          sendEvent({ type: 'content', content: delta.content });
+        }
+        if (delta.tool_calls) {
+          for (const tc of delta.tool_calls) {
+            const slot = toolSlots[tc.index || 0] || (toolSlots[tc.index || 0] = { id: '', name: '', arguments: '' });
+            if (tc.id) slot.id = tc.id;
+            if (tc.function) {
+              if (tc.function.name) slot.name += tc.function.name;
+              if (tc.function.arguments) slot.arguments += tc.function.arguments;
             }
           }
         }
       }
-      } finally {
-        clearInterval(stallWatchdog);
-        clearTimeout(idleWatchdog);
+    }
+    } catch (e) {
+      // A stalled/aborted turn may have already streamed tokens to the UI.
+      // Attach them so the retry loop can roll the client back and the
+      // re-attempt doesn't duplicate text.
+      if (e && typeof e === 'object') e.partial = content;
+      throw e;
+    } finally {
+      clearInterval(stallWatchdog);
+      clearTimeout(idleWatchdog);
+    }
+
+    // Replay this assistant turn into history (sanitized) for the next call.
+    const calls = toolSlots
+      .filter((s) => s.name || s.arguments)
+      .map((s, i) => ({
+        id: s.id || `call_${turn}_${i}`,
+        type: 'function',
+        function: { name: s.name, arguments: s.arguments || '{}' },
+      }));
+    return { content, calls, finishReason };
+  }
+
+  try {
+    for (let turn = 0; turn < AI_MAX_TURNS; turn++) {
+      if (disconnected) break;
+
+      // NVIDIA NIM intermittently accepts a request and then sends zero bytes
+      // for minutes (stalled/timeout). Auto-retry those so one flaky call
+      // doesn't kill the whole answer — the next attempt usually succeeds.
+      let turnOut;
+      for (let attempt = 1; ; attempt++) {
+        try {
+          turnOut = await streamTurn();
+          break;
+        } catch (e) {
+          if (disconnected || !(e.code === 'stalled' || e.code === 'timeout') || attempt > AI_RETRIES) throw e;
+          // If the failed turn already streamed some tokens, tell the client to
+          // drop them so the retried turn doesn't show duplicated text.
+          if (e.partial) sendEvent({ type: 'rollback', chars: e.partial.length });
+          console.error(`[ai] ${e.code}: provider hang, retrying (${attempt}/${AI_RETRIES})`);
+          sendEvent({ type: 'status', status: 'retrying', attempt, max: AI_RETRIES });
+        }
       }
 
-      // Replay this assistant turn into history (sanitized) for the next call.
-      const calls = toolSlots
-        .filter((s) => s.name || s.arguments)
-        .map((s, i) => ({
-          id: s.id || `call_${turn}_${i}`,
-          type: 'function',
-          function: { name: s.name, arguments: s.arguments || '{}' },
-        }));
+      const { content, calls, finishReason } = turnOut;
       history.push(sanitizeAssistantMessage({ role: 'assistant', content: content || null, tool_calls: calls }));
 
       if (calls.length) {
         await runTools(calls);
+        compactHistory(); // keep the prompt small so time-to-first-token stays low
         continue; // loop for the model's next turn
       }
 

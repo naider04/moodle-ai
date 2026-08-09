@@ -66,6 +66,10 @@ async function streamAI(messages, handlers) {
     switch (evt.type) {
       case 'status': handlers.onStatus && handlers.onStatus(evt); break;
       case 'content': reply += evt.content; handlers.onContent && handlers.onContent(evt.content); break;
+      case 'rollback':
+        reply = reply.slice(0, reply.length - evt.chars);
+        handlers.onRollback && handlers.onRollback(evt.chars);
+        break;
       case 'tool': trace.push(evt.trace); handlers.onTool && handlers.onTool(evt.trace); break;
       case 'done': return { reply, trace, code: evt.code };
       case 'error': {
@@ -792,6 +796,8 @@ function renderAI(content) {
 
     const addToolChip = (t) => {
       ensureBubble();
+      // Drop any "retrying…" notice so chips aren't shown under a stale one.
+      if (bodyEl.querySelector('.typing')) bodyEl.innerHTML = renderMarkdown(streamText);
       let tools = bubble.querySelector('.ai-tools');
       if (!tools) {
         tools = document.createElement('div');
@@ -813,6 +819,20 @@ function renderAI(content) {
           if (evt.status === 'thinking' && !started) {
             const b = ensureBubble();
             b.innerHTML = '<div class="typing">Thinking…</div>';
+          } else if (evt.status === 'still_waiting' && !started) {
+            const b = ensureBubble();
+            b.innerHTML = '<div class="typing">Still waiting for the model — slow response, not stuck.</div>';
+          } else if (evt.status === 'retrying') {
+            const b = ensureBubble();
+            b.innerHTML = `<div class="typing">Provider hiccup — retrying (${evt.attempt}/${evt.max})…</div>`;
+          }
+        },
+        onRollback: (chars) => {
+          if (!streamText) return;
+          streamText = streamText.slice(0, streamText.length - chars);
+          if (!renderPending) {
+            renderPending = true;
+            requestAnimationFrame(renderLive);
           }
         },
         onContent: (chunk) => {
