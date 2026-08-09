@@ -65,10 +65,11 @@ async function streamAI(messages, handlers) {
   const dispatch = (evt) => {
     switch (evt.type) {
       case 'status': handlers.onStatus && handlers.onStatus(evt); break;
+      case 'reasoning': handlers.onReasoning && handlers.onReasoning(evt.content); break;
       case 'content': reply += evt.content; handlers.onContent && handlers.onContent(evt.content); break;
       case 'rollback':
         reply = reply.slice(0, reply.length - evt.chars);
-        handlers.onRollback && handlers.onRollback(evt.chars);
+        handlers.onRollback && handlers.onRollback(evt);
         break;
       case 'tool': trace.push(evt.trace); handlers.onTool && handlers.onTool(evt.trace); break;
       case 'done': return { reply, trace, code: evt.code };
@@ -772,13 +773,18 @@ function renderAI(content) {
     let bodyEl = null;
     let started = false;
     let streamText = '';
+    let reasoningText = '';
     let renderPending = false;
+
+    const renderBubble = () => {
+      const b = ensureBubble();
+      b.innerHTML = (reasoningText ? `<div class="ai-reasoning">${esc(reasoningText)}</div>` : '') + renderMarkdown(streamText);
+      history.scrollTop = history.scrollHeight;
+    };
 
     const renderLive = () => {
       renderPending = false;
-      const b = ensureBubble();
-      b.innerHTML = renderMarkdown(streamText);
-      history.scrollTop = history.scrollHeight;
+      renderBubble();
     };
 
     const ensureBubble = () => {
@@ -797,7 +803,7 @@ function renderAI(content) {
     const addToolChip = (t) => {
       ensureBubble();
       // Drop any "retrying…" notice so chips aren't shown under a stale one.
-      if (bodyEl.querySelector('.typing')) bodyEl.innerHTML = renderMarkdown(streamText);
+      if (bodyEl.querySelector('.typing')) renderBubble();
       let tools = bubble.querySelector('.ai-tools');
       if (!tools) {
         tools = document.createElement('div');
@@ -827,9 +833,18 @@ function renderAI(content) {
             b.innerHTML = `<div class="typing">Provider hiccup — retrying (${evt.attempt}/${evt.max})…</div>`;
           }
         },
-        onRollback: (chars) => {
-          if (!streamText) return;
-          streamText = streamText.slice(0, streamText.length - chars);
+        onRollback: (evt) => {
+          if (evt.reasoningChars && reasoningText) {
+            reasoningText = reasoningText.slice(0, reasoningText.length - evt.reasoningChars);
+          }
+          if (streamText) streamText = streamText.slice(0, streamText.length - evt.chars);
+          if (!renderPending) {
+            renderPending = true;
+            requestAnimationFrame(renderLive);
+          }
+        },
+        onReasoning: (chunk) => {
+          reasoningText += chunk;
           if (!renderPending) {
             renderPending = true;
             requestAnimationFrame(renderLive);

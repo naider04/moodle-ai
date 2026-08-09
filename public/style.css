@@ -345,6 +345,9 @@ input:focus, select:focus, textarea:focus {
 .ai-suggestion:hover { background: #fbe3c9; }
 .typing { color: var(--text-dim); font-style: italic; }
 
+/* Streaming reasoning tokens (shown dimmed above the answer, never saved). */
+.ai-reasoning { font-size: 12px; color: var(--text-dim); opacity: 0.8; border-left: 2px solid var(--border); padding-left: 10px; margin-bottom: 8px; white-space: pre-wrap; line-height: 1.5; max-height: 180px; overflow-y: auto; }
+
 /* AI provider bar + add/edit dialog */
 .ai-provider-bar { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
 .ai-provider-bar label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); }

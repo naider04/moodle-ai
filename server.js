@@ -614,10 +614,12 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
 
   // Stream the answer to the browser as Server-Sent Events:
   //   data: {"type":"status","status":"thinking"}        model is reasoning
+  //   data: {"type":"reasoning","content":"..."}     reasoning tokens (shown dimmed, not saved)
   //   data: {"type":"status","status":"still_waiting"}  no bytes for AI_STALL_WARN_MS (slow, not stuck)
   //   data: {"type":"status","status":"retrying",     provider stalled/timed out; re-attempting
   //          "attempt":N,"max":M}
-  //   data: {"type":"rollback","chars":N}            drop the last N content chars (stalled turn retried)
+  //   data: {"type":"rollback","chars":N,            drop the last N content chars and M reasoning
+  //          "reasoningChars":M}                       chars (stalled turn retried)
   //   data: {"type":"status","status":"error",          terminal failure; code identifies the cause
   //          "code":"...","message":"..."}
   //   data: {"type":"content","content":"..."}      visible answer tokens
@@ -873,6 +875,7 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
     }, 2000);
 
     let content = '';
+    let reasoning = '';
     let reasoningSeen = false;
     let finishReason = null;
     const toolSlots = [];
@@ -900,9 +903,16 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
         if (!choice) continue;
         if (choice.finish_reason) finishReason = choice.finish_reason;
         const delta = choice.delta || {};
-        if ((delta.reasoning || delta.reasoning_content) && !reasoningSeen) {
-          reasoningSeen = true;
-          sendEvent({ type: 'status', status: 'thinking' });
+        if (delta.reasoning || delta.reasoning_content) {
+          if (!reasoningSeen) {
+            reasoningSeen = true;
+            sendEvent({ type: 'status', status: 'thinking' });
+          }
+          // Forward reasoning tokens so the UI can show them streaming
+          // (display-only — never added to history or the final reply).
+          const rText = delta.reasoning || delta.reasoning_content;
+          reasoning += rText;
+          sendEvent({ type: 'reasoning', content: rText });
         }
         if (delta.content) {
           content += delta.content;
@@ -921,10 +931,13 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
       }
     }
     } catch (e) {
-      // A stalled/aborted turn may have already streamed tokens to the UI.
-      // Attach them so the retry loop can roll the client back and the
-      // re-attempt doesn't duplicate text.
-      if (e && typeof e === 'object') e.partial = content;
+      // A stalled/aborted turn may have already streamed reasoning and/or
+      // answer tokens to the UI. Attach them so the retry loop can roll the
+      // client back and the re-attempt doesn't duplicate text.
+      if (e && typeof e === 'object') {
+        e.partial = content;
+        e.partialReasoning = reasoning;
+      }
       throw e;
     } finally {
       clearInterval(stallWatchdog);
@@ -956,9 +969,15 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
           break;
         } catch (e) {
           if (disconnected || !(e.code === 'stalled' || e.code === 'timeout') || attempt > AI_RETRIES) throw e;
-          // If the failed turn already streamed some tokens, tell the client to
-          // drop them so the retried turn doesn't show duplicated text.
-          if (e.partial) sendEvent({ type: 'rollback', chars: e.partial.length });
+          // If the failed turn already streamed reasoning and/or answer tokens,
+          // tell the client to drop them so the retried turn isn't duplicated.
+          if (e.partial || e.partialReasoning) {
+            sendEvent({
+              type: 'rollback',
+              chars: e.partial ? e.partial.length : 0,
+              reasoningChars: e.partialReasoning ? e.partialReasoning.length : 0,
+            });
+          }
           console.error(`[ai] ${e.code}: provider hang, retrying (${attempt}/${AI_RETRIES})`);
           sendEvent({ type: 'status', status: 'retrying', attempt, max: AI_RETRIES });
         }
