@@ -37,10 +37,12 @@ async function api(path, { method = 'GET', body } = {}) {
 
 /** Stream the AI answer (SSE) and call back as tokens/tools arrive. */
 async function streamAI(messages, handlers) {
+  let timezone = '';
+  try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch { /* keep empty */ }
   const res = await fetch('/api/ai/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages }),
+    body: JSON.stringify({ messages, timezone, offsetMinutes: -new Date().getTimezoneOffset() }),
     signal: handlers.signal,
   });
   if (res.status === 401) {

@@ -527,6 +527,42 @@ app.post('/api/ai/active', requireAuth, (req, res) => {
   res.json({ ok: true, activeId: id });
 });
 
+/**
+ * Build a "now" description for the AI: the server's current date/time and,
+ * when the browser tells us its timezone, the user's local date/time too.
+ * Falls back to the raw UTC offset (minutes east of UTC) when no IANA
+ * timezone is available. Used so the model can reason about "today",
+ * "this week", deadlines, and other time-sensitive questions.
+ */
+function describeNow(timezone, offsetMinutes) {
+  const now = new Date();
+  let serverTz = 'UTC';
+  try { serverTz = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { /* keep UTC */ }
+  const fmtOpts = { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', second: '2-digit' };
+  const serverLabel = now.toLocaleString('en-US', fmtOpts);
+
+  const lines = [`The server's current date and time is ${serverLabel} (${serverTz}, ISO ${now.toISOString()}).`];
+
+  const tz = typeof timezone === 'string' && timezone ? timezone : '';
+  if (tz) {
+    try {
+      const userLabel = new Intl.DateTimeFormat('en-US', { ...fmtOpts, timeZone: tz }).format(now);
+      lines.push(`The user's local date and time is ${userLabel} (${tz}). Treat this as "now" when answering questions about due dates, today, this week, or the current time.`);
+      return lines.join('\n');
+    } catch { /* invalid timezone -> fall back to the offset below */ }
+  }
+  const off = Number(offsetMinutes);
+  if (Number.isFinite(off)) {
+    const local = new Date(now.getTime() + off * 60000);
+    const userLabel = local.toLocaleString('en-US', fmtOpts);
+    const sign = off < 0 ? '-' : '+';
+    const abs = Math.abs(off);
+    const offsetLabel = `UTC${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`;
+    lines.push(`The user's local date and time is ${userLabel} (${offsetLabel}). Treat this as "now" when answering questions about due dates, today, this week, or the current time.`);
+  }
+  return lines.join('\n');
+}
+
 app.post('/api/ai/chat', requireAuth, async (req, res) => {
   const activeProvider =
     providers.find((p) => p.id === req.session.activeProviderId) ||
@@ -546,6 +582,7 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
   const system = [
     `You are the AI assistant inside a desktop Moodle viewer.`,
     `The logged-in user is ${user.fullname} (${user.username}) on the Moodle site ${req.session.siteUrl} (${user.sitename || ''}).`,
+    describeNow(req.body.timezone, req.body.offsetMinutes),
     `You have full access to their Moodle account through the "moodle_ws" tool. Whenever you need any data from Moodle, call the tool with the right function name and params.`,
     `When the user asks for a summary (grades, pending tasks, calendar, messages...), gather the data with the tool and present a clear, friendly summary.`,
     `You may also perform actions on their behalf when they ask (e.g. mark messages read, post forum replies, submit forms), but never call write functions without the user's explicit request.`,
