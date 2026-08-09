@@ -64,11 +64,15 @@ async function streamAI(messages, handlers) {
 
   const dispatch = (evt) => {
     switch (evt.type) {
-      case 'status': handlers.onStatus && handlers.onStatus(evt.status); break;
+      case 'status': handlers.onStatus && handlers.onStatus(evt); break;
       case 'content': reply += evt.content; handlers.onContent && handlers.onContent(evt.content); break;
       case 'tool': trace.push(evt.trace); handlers.onTool && handlers.onTool(evt.trace); break;
-      case 'done': return { reply, trace };
-      case 'error': throw new Error(evt.error);
+      case 'done': return { reply, trace, code: evt.code };
+      case 'error': {
+        const err = new Error(evt.error || 'AI request failed');
+        err.code = evt.code || 'unknown';
+        throw err;
+      }
     }
     return null;
   };
@@ -805,8 +809,8 @@ function renderAI(content) {
     try {
       const outcome = await streamAI(state.aiMessages, {
         signal: abortCtrl.signal,
-        onStatus: (status) => {
-          if (status === 'thinking' && !started) {
+        onStatus: (evt) => {
+          if (evt.status === 'thinking' && !started) {
             const b = ensureBubble();
             b.innerHTML = '<div class="typing">Thinking…</div>';
           }
@@ -823,8 +827,10 @@ function renderAI(content) {
         onTool: addToolChip,
       });
       if (bubble) bubble.remove();
-      state.aiMessages.push({ role: 'assistant', content: outcome.reply || '', trace: outcome.trace });
-      renderMsg({ role: 'assistant', content: outcome.reply || '', trace: outcome.trace });
+      const replyText = outcome.reply || '';
+      const note = outcome.code && outcome.code !== 'unknown' ? `\n\n_Reason: \`${outcome.code}\`._` : '';
+      state.aiMessages.push({ role: 'assistant', content: replyText + note, trace: outcome.trace });
+      renderMsg({ role: 'assistant', content: replyText + note, trace: outcome.trace });
       saveAIMessages();
     } catch (e) {
       if (e && e.name === 'AbortError') {
@@ -839,7 +845,8 @@ function renderAI(content) {
         state.aiMessages.push({ role: 'assistant', content: partial + (partial ? '\n\n' : '') + '_⏹ Stopped._', trace: [] });
       } else {
         if (bubble) bubble.remove();
-        renderMsg({ role: 'assistant', content: `⚠️ ${e.message}` });
+        const code = e.code && e.code !== 'unknown' ? `\n\n_Reason: \`${e.code}\`._` : '';
+        renderMsg({ role: 'assistant', content: `⚠️ ${e.message}${code}` });
       }
       saveAIMessages();
     } finally {

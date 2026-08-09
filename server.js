@@ -147,7 +147,17 @@ async function moodleCall(siteUrl, token, wsfunction, params = {}) {
   const body = new URLSearchParams(
     flattenParams({ wsfunction, wstoken: token, ...params }),
   );
-  const res = await fetch(url, { method: 'POST', body });
+  let res;
+  try {
+    res = await fetch(url, { method: 'POST', body, signal: AbortSignal.timeout(MOODLE_TIMEOUT_MS) });
+  } catch (e) {
+    if (e.name === 'TimeoutError' || e.name === 'AbortError') {
+      const err = new Error(`Moodle web service timed out after ${Math.round(MOODLE_TIMEOUT_MS / 1000)}s`);
+      err.status = 504;
+      throw err;
+    }
+    throw e;
+  }
   const text = await res.text();
   let data;
   try {
@@ -323,6 +333,9 @@ app.get('/api/proxy', requireAuth, async (req, res) => {
  * ------------------------------------------------------------------ */
 
 const AI_MAX_TURNS = parseInt(process.env.AI_MAX_TURNS || '8', 10);
+const AI_TIMEOUT_MS = parseInt(process.env.AI_TIMEOUT_MS || '90000', 10); // per LLM call: connect + stream
+const AI_STALL_MS = parseInt(process.env.AI_STALL_MS || '6000', 10); // abort if the provider sends no SSE bytes for this long
+const MOODLE_TIMEOUT_MS = parseInt(process.env.MOODLE_TIMEOUT_MS || '30000', 10); // per Moodle web service call
 
 /* ------------------------------------------------------------------ *
  * AI providers — OpenAI-compatible endpoints, persisted in providers.json.
@@ -588,6 +601,8 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
     `You may also perform actions on their behalf when they ask (e.g. mark messages read, post forum replies, submit forms), but never call write functions without the user's explicit request.`,
     `Respond in the same language the user writes in. Be concise but complete.`,
     `File links returned by the Moodle web service (fileurl, webservice/pluginfile.php) open and download directly in this viewer — always give those exact URLs when listing files, and do not suggest workarounds for opening them.`,
+    `Data you already retrieved in this conversation is still in context — do not re-fetch it with another tool call unless it may have changed (e.g. after an action you performed).`,
+    `To link to an activity use ${req.session.siteUrl}/mod/{modname}/view.php?id={coursemodule} (e.g. mod/quiz/view.php for quizzes). The coursemodule id comes from the mod_* functions (e.g. mod_quiz_get_quizzes_by_courses); core_enrol_get_users_courses returns no module ids.`,
     `Useful functions include: core_enrol_get_users_courses, core_course_get_contents, core_webservice_get_site_info, gradereport_user_get_grade_items, gradereport_overview_get_course_grades, core_calendar_get_action_events_by_timesort, core_message_get_conversations, core_message_get_conversation_messages, core_message_mark_all_conversation_messages_as_read, core_completion_get_activities_completion_status, mod_assign_get_assignments, mod_assign_get_submission_status, mod_forum_get_forums_by_courses, mod_forum_get_forum_discussions, mod_forum_add_discussion_post, mod_quiz_get_quizzes_by_courses, mod_quiz_get_user_attempts, core_files_get_files, core_user_get_course_user_profiles.`,
   ].join('\n');
 
@@ -596,10 +611,14 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
 
   // Stream the answer to the browser as Server-Sent Events:
   //   data: {"type":"status","status":"thinking"}   model is reasoning
+  //   data: {"type":"status","status":"error",      terminal failure; code identifies the cause
+  //          "code":"...","message":"..."}
   //   data: {"type":"content","content":"..."}      visible answer tokens
   //   data: {"type":"tool","trace":{...}}            a Moodle tool ran
-  //   data: {"type":"done","reply":"...","trace":[...]}
-  //   data: {"type":"error","error":"..."}
+  //   data: {"type":"done","reply":"...","trace":[...],"code":optional}
+  //   data: {"type":"error","error":"...","code":"..."}
+  // Failure codes: timeout | stalled | rate_limit | auth | api_error |
+  //                http_error | max_turns | client_disconnect | interrupted | unknown
   res.set({
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache',
@@ -624,6 +643,75 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
     disconnected = true;
     upstream.controller && upstream.controller.abort();
   });
+
+  /**
+   * Truncate a JSON string at a point that still parses as valid JSON, so the
+   * model never receives a mid-document slice that breaks its tool results.
+   * Cuts at an element boundary and closes the root container; the marker
+   * line tells the model the data was cut, and the last resort is a minimal
+   * valid placeholder rather than broken JSON.
+   */
+  function truncateJson(payload, max) {
+    if (payload.length <= max) return payload;
+    const rootClose = payload[0] === '[' ? ']' : payload[0] === '{' ? '}' : '';
+    let end = max;
+    for (let attempt = 0; attempt < 64; attempt++) {
+      end = Math.max(
+        payload.lastIndexOf(',', end),
+        payload.lastIndexOf('}', end),
+        payload.lastIndexOf(']', end),
+      );
+      if (end <= 0) break;
+      // A comma cut must drop the comma (it would leave a trailing comma);
+      // a brace cut keeps the closing brace of the complete element.
+      const cutEnd = payload[end] === ',' ? end : end + 1;
+      const candidate = payload.slice(0, cutEnd) + rootClose;
+      try {
+        JSON.parse(candidate);
+        return `${candidate}\n[truncated: data exceeded ${max} characters — re-query with narrower params if needed]`;
+      } catch {
+        end -= 1; // cut earlier next try
+      }
+    }
+    const minimal = rootClose ? `${payload[0]}${rootClose}` : 'null';
+    return `${minimal}\n[truncated: data exceeded ${max} characters — re-query with narrower params if needed]`;
+  }
+
+  /**
+   * Slim known-heavy tool results before they go into the model context:
+   * drop fields that cost tokens (HTML summaries, embedded question lists)
+   * but keep everything the model needs to answer and to build links.
+   */
+  function slimToolResult(fn, result) {
+    if (fn === 'core_enrol_get_users_courses' && Array.isArray(result)) {
+      return result.map((c) => ({
+        id: c.id,
+        fullname: c.fullname,
+        shortname: c.shortname,
+        idnumber: c.idnumber,
+        startdate: c.startdate,
+        enddate: c.enddate,
+        visible: c.visible,
+        ...(typeof c.progress === 'number' ? { progress: c.progress } : {}),
+      }));
+    }
+    if (fn === 'mod_quiz_get_quizzes_by_courses' && Array.isArray(result)) {
+      return result.map((q) => ({
+        id: q.id,
+        coursemodule: q.coursemodule,
+        course: q.course,
+        name: q.name,
+        intro: q.intro ? String(q.intro).slice(0, 500) : '',
+        timeopen: q.timeopen,
+        timeclose: q.timeclose,
+        timelimit: q.timelimit,
+        attempts: q.attempts,
+        attemptlimit: q.attemptlimit,
+        hasquestions: q.hasquestions,
+      }));
+    }
+    return result;
+  }
 
   /** Execute tool calls, stream their traces, and push results into history. */
   async function runTools(calls) {
@@ -670,11 +758,10 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
         const t = { function: fn, params: toolParams, ok: true };
         trace.push(t);
         sendEvent({ type: 'tool', trace: t });
-        const payload = JSON.stringify(result);
         history.push({
           role: 'tool',
           tool_call_id: call.id,
-          content: payload.length > 60000 ? payload.slice(0, 60000) : payload,
+          content: truncateJson(JSON.stringify(slimToolResult(fn, result)), 60000),
         });
       } catch (e) {
         const t = { function: fn, params: toolParams, ok: false, error: e.message };
@@ -695,29 +782,62 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
       const controller = new AbortController();
       upstream.controller = controller;
 
-      const response = await fetch(aiEndpoint, {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${aiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          ...(aiModel ? { model: aiModel } : {}),
-          messages: history,
-          tools: [MOODLE_TOOL],
-          temperature: 0.3,
-          max_tokens: 4000,
-          stream: true,
-        }),
-        signal: controller.signal,
-      });
+      // Watchdog: if the provider hasn't answered at all within the budget,
+      // abort and report it as a timeout instead of hanging forever.
+      const idleWatchdog = setTimeout(() => {
+        const err = new Error(`No response from the AI provider after ${Math.round(AI_TIMEOUT_MS / 1000)}s`);
+        err.code = 'timeout';
+        controller.abort(err);
+      }, AI_TIMEOUT_MS);
+
+      let response;
+      try {
+        response = await fetch(aiEndpoint, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${aiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            ...(aiModel ? { model: aiModel } : {}),
+            messages: history,
+            tools: [MOODLE_TOOL],
+            temperature: 0.3,
+            max_tokens: 4000,
+            stream: true,
+          }),
+          signal: controller.signal,
+        });
+      } catch (e) {
+        clearTimeout(idleWatchdog);
+        throw e;
+      }
 
       if (!response.ok || !response.body) {
+        clearTimeout(idleWatchdog);
         const text = await response.text();
-        throw new Error(`AI API error ${response.status}: ${text.slice(0, 500)}`);
+        const err = new Error(`AI API error ${response.status}: ${text.slice(0, 500)}`);
+        err.code = response.status === 429
+          ? 'rate_limit'
+          : response.status === 401 || response.status === 403 ? 'auth'
+          : response.status >= 500 ? 'api_error'
+          : 'http_error';
+        err.status = response.status;
+        throw err;
       }
 
       // Consume the upstream SSE, accumulating content and tool-call fragments.
+      // Stall watchdog: if the provider stops sending bytes mid-stream, abort
+      // and report it so we never leave the user staring at "Thinking…" forever.
+      let lastChunkAt = Date.now();
+      const stallWatchdog = setInterval(() => {
+        if (Date.now() - lastChunkAt > AI_STALL_MS) {
+          const err = new Error(`The AI provider sent no data for ${Math.round(AI_STALL_MS / 1000)}s`);
+          err.code = 'stalled';
+          controller.abort(err);
+        }
+      }, 2000);
+
       let content = '';
       let reasoningSeen = false;
       let finishReason = null;
@@ -727,9 +847,11 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
       const decoder = new TextDecoder();
       let buf = '';
 
+      try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
+        lastChunkAt = Date.now();
         buf += decoder.decode(value, { stream: true });
         const lines = buf.split('\n');
         buf = lines.pop();
@@ -764,6 +886,10 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
           }
         }
       }
+      } finally {
+        clearInterval(stallWatchdog);
+        clearTimeout(idleWatchdog);
+      }
 
       // Replay this assistant turn into history (sanitized) for the next call.
       const calls = toolSlots
@@ -789,11 +915,34 @@ app.post('/api/ai/chat', requireAuth, async (req, res) => {
       return res.end();
     }
 
-    sendEvent({ type: 'done', reply: 'I could not finish answering in time. Please try a simpler question.', trace });
+    sendEvent({
+      type: 'done',
+      reply: `I could not finish answering in time — the model reached the ${AI_MAX_TURNS}-turn tool limit without a final answer. Please try a simpler question.`,
+      trace,
+      code: 'max_turns',
+    });
+    console.error(`[ai] max_turns: model used all ${AI_MAX_TURNS} turns without a final answer`);
     res.end();
   } catch (e) {
     if (!res.writableEnded) {
-      sendEvent({ type: 'error', error: e.message });
+      let code = e.code || 'unknown';
+      let message = e.message || String(e);
+      const reason = upstream.controller && upstream.controller.signal.reason;
+      if (e.name === 'AbortError') {
+        if (disconnected) {
+          code = 'client_disconnect';
+          message = 'Connection to the browser was closed.';
+        } else if (reason && reason.code) {
+          code = reason.code;
+          message = reason.message;
+        } else {
+          code = 'interrupted';
+          message = 'The AI request was interrupted.';
+        }
+      }
+      console.error(`[ai] ${code}: ${message}`);
+      sendEvent({ type: 'status', status: 'error', code, message });
+      sendEvent({ type: 'error', error: message, code });
       res.end();
     }
   }
